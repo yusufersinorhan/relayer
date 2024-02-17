@@ -6,7 +6,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -34,13 +34,9 @@ import (
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"golang.org/x/term"
 )
 
-const (
-	MB      = 1024 * 1024 // in bytes
-	appName = "rly"
-)
+const appName = "rly"
 
 var defaultHome = filepath.Join(os.Getenv("HOME"), ".relayer")
 
@@ -57,9 +53,9 @@ func NewRootCmd(log *zap.Logger) *cobra.Command {
 	// Use a local app state instance scoped to the new root command,
 	// so that tests don't concurrently access the state.
 	a := &appState{
-		Viper: viper.New(),
+		viper: viper.New(),
 
-		Log: log,
+		log: log,
 	}
 
 	// RootCmd represents the base command when called without any subcommands
@@ -77,38 +73,42 @@ func NewRootCmd(log *zap.Logger) *cobra.Command {
 
 	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
 		// Inside persistent pre-run because this takes effect after flags are parsed.
-		if log == nil {
-			log, err := newRootLogger(a.Viper.GetString("log-format"), a.Viper.GetBool("debug"))
-			if err != nil {
-				return err
-			}
-
-			a.Log = log
-		}
-
 		// reads `homeDir/config/config.yaml` into `a.Config`
-		return initConfig(rootCmd, a)
+		if err := a.loadConfigFile(rootCmd.Context()); err != nil {
+			return err
+		}
+		// Inside persistent pre-run because this takes effect after flags are parsed.
+		if a.log == nil {
+			a.initLogger("")
+		}
+		return nil
 	}
 
 	rootCmd.PersistentPostRun = func(cmd *cobra.Command, _ []string) {
 		// Force syncing the logs before exit, if anything is buffered.
-		a.Log.Sync()
+		_ = a.log.Sync()
 	}
 
 	// Register --home flag
-	rootCmd.PersistentFlags().StringVar(&a.HomePath, flagHome, defaultHome, "set home directory")
-	if err := a.Viper.BindPFlag(flagHome, rootCmd.PersistentFlags().Lookup(flagHome)); err != nil {
+	rootCmd.PersistentFlags().StringVar(&a.homePath, flagHome, defaultHome, "set home directory")
+	if err := a.viper.BindPFlag(flagHome, rootCmd.PersistentFlags().Lookup(flagHome)); err != nil {
 		panic(err)
 	}
 
 	// Register --debug flag
-	rootCmd.PersistentFlags().BoolVarP(&a.Debug, "debug", "d", false, "debug output")
-	if err := a.Viper.BindPFlag("debug", rootCmd.PersistentFlags().Lookup("debug")); err != nil {
+	rootCmd.PersistentFlags().BoolVarP(&a.debug, "debug", "d", false, "debug output")
+	if err := a.viper.BindPFlag("debug", rootCmd.PersistentFlags().Lookup("debug")); err != nil {
 		panic(err)
 	}
 
 	rootCmd.PersistentFlags().String("log-format", "auto", "log output format (auto, logfmt, json, or console)")
-	if err := a.Viper.BindPFlag("log-format", rootCmd.PersistentFlags().Lookup("log-format")); err != nil {
+	if err := a.viper.BindPFlag("log-format", rootCmd.PersistentFlags().Lookup("log-format")); err != nil {
+		panic(err)
+	}
+
+	// Register --log-level flag
+	rootCmd.PersistentFlags().String("log-level", "", "log level format (info, debug, warn, error, panic or fatal)")
+	if err := a.viper.BindPFlag("log-level", rootCmd.PersistentFlags().Lookup("log-level")); err != nil {
 		panic(err)
 	}
 
@@ -124,6 +124,7 @@ func NewRootCmd(log *zap.Logger) *cobra.Command {
 		startCmd(a),
 		lineBreakCommand(),
 		getVersionCmd(a),
+		addressCmd(a),
 	)
 
 	return rootCmd
@@ -174,7 +175,7 @@ func Execute() {
 	}
 }
 
-func newRootLogger(format string, debug bool) (*zap.Logger, error) {
+func newRootLogger(format string, logLevel string) (*zap.Logger, error) {
 	config := zap.NewProductionEncoderConfig()
 	config.EncodeTime = func(ts time.Time, encoder zapcore.PrimitiveArrayEncoder) {
 		encoder.AppendString(ts.UTC().Format("2006-01-02T15:04:05.000000Z07:00"))
@@ -185,25 +186,26 @@ func newRootLogger(format string, debug bool) (*zap.Logger, error) {
 	switch format {
 	case "json":
 		enc = zapcore.NewJSONEncoder(config)
-	case "console":
+	case "auto", "console":
 		enc = zapcore.NewConsoleEncoder(config)
 	case "logfmt":
 		enc = zaplogfmt.NewEncoder(config)
-	case "auto":
-		if term.IsTerminal(int(os.Stderr.Fd())) {
-			// When a user runs relayer in the foreground, use easier to read output.
-			enc = zapcore.NewConsoleEncoder(config)
-		} else {
-			// Otherwise, use consistent logfmt format for simplistic machine processing.
-			enc = zaplogfmt.NewEncoder(config)
-		}
 	default:
 		return nil, fmt.Errorf("unrecognized log format %q", format)
 	}
 
 	level := zap.InfoLevel
-	if debug {
+	switch logLevel {
+	case "debug":
 		level = zap.DebugLevel
+	case "warn":
+		level = zapcore.WarnLevel
+	case "error":
+		level = zapcore.ErrorLevel
+	case "panic":
+		level = zapcore.PanicLevel
+	case "fatal":
+		level = zapcore.FatalLevel
 	}
 	return zap.New(zapcore.NewCore(
 		enc,

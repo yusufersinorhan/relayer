@@ -1,18 +1,24 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/avast/retry-go/v4"
+
 	sdk "github.com/cosmos/cosmos-sdk/types"
-	chantypes "github.com/cosmos/ibc-go/v5/modules/core/04-channel/types"
+	chantypes "github.com/cosmos/ibc-go/v8/modules/core/04-channel/types"
 	"github.com/cosmos/relayer/v2/relayer"
+	"github.com/cosmos/relayer/v2/relayer/processor"
 	"github.com/cosmos/relayer/v2/relayer/provider"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 )
+
+const flushTimeout = 10 * time.Minute
 
 // transactionCmd returns a parent transaction command handler, where all child
 // commands can submit transactions on IBC-connected networks.
@@ -31,6 +37,7 @@ Most of these commands take a [path] argument. Make sure:
 	cmd.AddCommand(
 		linkCmd(a),
 		linkThenStartCmd(a),
+		flushCmd(a),
 		relayMsgsCmd(a),
 		relayAcksCmd(a),
 		xfersend(a),
@@ -43,6 +50,7 @@ Most of these commands take a [path] argument. Make sure:
 		createChannelCmd(a),
 		closeChannelCmd(a),
 		lineBreakCommand(),
+		registerCounterpartyCmd(a),
 	)
 
 	return cmd
@@ -72,12 +80,24 @@ func createClientsCmd(a *appState) *cobra.Command {
 				return err
 			}
 
+			maxClockDrift, err := cmd.Flags().GetDuration(flagMaxClockDrift)
+			if err != nil {
+				return err
+			}
+
+			customClientTrustingPeriodPercentage, err := cmd.Flags().GetInt64(flagClientTrustingPeriodPercentage)
+			if err != nil {
+				return err
+			}
+
 			override, err := cmd.Flags().GetBool(flagOverride)
 			if err != nil {
 				return err
 			}
 
-			c, src, dst, err := a.Config.ChainsFromPath(args[0])
+			path := args[0]
+
+			c, src, dst, err := a.config.ChainsFromPath(path)
 			if err != nil {
 				return err
 			}
@@ -90,12 +110,23 @@ func createClientsCmd(a *appState) *cobra.Command {
 				return fmt.Errorf("key %s not found on dst chain %s", c[dst].ChainProvider.Key(), c[dst].ChainID())
 			}
 
-			modified, err := c[src].CreateClients(cmd.Context(), c[dst], allowUpdateAfterExpiry, allowUpdateAfterMisbehaviour, override, customClientTrustingPeriod, a.Config.memo(cmd))
+			clientSrc, clientDst, err := c[src].CreateClients(
+				cmd.Context(),
+				c[dst],
+				allowUpdateAfterExpiry,
+				allowUpdateAfterMisbehaviour,
+				override,
+				customClientTrustingPeriod,
+				maxClockDrift,
+				customClientTrustingPeriodPercentage,
+				a.config.memo(cmd),
+			)
 			if err != nil {
 				return err
 			}
-			if modified {
-				if err := a.OverwriteConfig(a.Config); err != nil {
+
+			if clientSrc != "" || clientDst != "" {
+				if err := a.updatePathConfig(cmd.Context(), path, clientSrc, clientDst, "", ""); err != nil {
 					return err
 				}
 			}
@@ -104,9 +135,9 @@ func createClientsCmd(a *appState) *cobra.Command {
 		},
 	}
 
-	cmd = clientParameterFlags(a.Viper, cmd)
-	cmd = overrideFlag(a.Viper, cmd)
-	cmd = memoFlag(a.Viper, cmd)
+	cmd = clientParameterFlags(a.viper, cmd)
+	cmd = overrideFlag(a.viper, cmd)
+	cmd = memoFlag(a.viper, cmd)
 	return cmd
 }
 
@@ -134,22 +165,38 @@ func createClientCmd(a *appState) *cobra.Command {
 				return err
 			}
 
+			customClientTrustingPeriodPercentage, err := cmd.Flags().GetInt64(flagClientTrustingPeriodPercentage)
+			if err != nil {
+				return err
+			}
+
+			overrideUnbondingPeriod, err := cmd.Flags().GetDuration(flagClientUnbondingPeriod)
+			if err != nil {
+				return err
+			}
+
 			override, err := cmd.Flags().GetBool(flagOverride)
 			if err != nil {
 				return err
 			}
 
-			src, ok := a.Config.Chains[args[0]]
+			maxClockDrift, err := cmd.Flags().GetDuration(flagMaxClockDrift)
+			if err != nil {
+				return err
+			}
+
+			src, ok := a.config.Chains[args[0]]
 			if !ok {
 				return errChainNotFound(args[0])
 			}
-			dst, ok := a.Config.Chains[args[1]]
+
+			dst, ok := a.config.Chains[args[1]]
 			if !ok {
 				return errChainNotFound(args[1])
 			}
 
 			pathName := args[2]
-			path, err := a.Config.Paths.Get(pathName)
+			path, err := a.config.Paths.Get(pathName)
 			if err != nil {
 				return err
 			}
@@ -161,6 +208,7 @@ func createClientCmd(a *appState) *cobra.Command {
 			if exists := src.ChainProvider.KeyExists(src.ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on src chain %s", src.ChainProvider.Key(), src.ChainID())
 			}
+
 			if exists := dst.ChainProvider.KeyExists(dst.ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on dst chain %s", dst.ChainProvider.Key(), dst.ChainID())
 			}
@@ -185,28 +233,53 @@ func createClientCmd(a *appState) *cobra.Command {
 					return err
 				}
 				return nil
-			}, retry.Context(cmd.Context()), relayer.RtyAtt, relayer.RtyDel, relayer.RtyErr, retry.OnRetry(func(n uint, err error) {
-				a.Log.Info(
-					"Failed to get light signed header",
-					zap.String("src_chain_id", src.ChainID()),
-					zap.Int64("src_height", srch),
-					zap.String("dst_chain_id", dst.ChainID()),
-					zap.Int64("dst_height", dsth),
-					zap.Uint("attempt", n+1),
-					zap.Uint("max_attempts", relayer.RtyAttNum),
-					zap.Error(err),
-				)
-				srch, dsth, _ = relayer.QueryLatestHeights(cmd.Context(), src, dst)
-			})); err != nil {
+			}, retry.Context(
+				cmd.Context()),
+				relayer.RtyAtt,
+				relayer.RtyDel,
+				relayer.RtyErr,
+				retry.OnRetry(func(n uint, err error) {
+					a.log.Info(
+						"Failed to get light signed header",
+						zap.String("src_chain_id", src.ChainID()),
+						zap.Int64("src_height", srch),
+						zap.String("dst_chain_id", dst.ChainID()),
+						zap.Int64("dst_height", dsth),
+						zap.Uint("attempt", n+1),
+						zap.Uint("max_attempts", relayer.RtyAttNum),
+						zap.Error(err),
+					)
+					srch, dsth, _ = relayer.QueryLatestHeights(cmd.Context(), src, dst)
+				})); err != nil {
 				return err
 			}
 
-			modified, err := relayer.CreateClient(cmd.Context(), src, dst, srcUpdateHeader, dstUpdateHeader, allowUpdateAfterExpiry, allowUpdateAfterMisbehaviour, override, customClientTrustingPeriod, a.Config.memo(cmd))
+			clientID, err := relayer.CreateClient(
+				cmd.Context(),
+				src, dst,
+				srcUpdateHeader, dstUpdateHeader,
+				allowUpdateAfterExpiry,
+				allowUpdateAfterMisbehaviour,
+				override,
+				customClientTrustingPeriod,
+				overrideUnbondingPeriod,
+				maxClockDrift,
+				customClientTrustingPeriodPercentage,
+				a.config.memo(cmd),
+			)
 			if err != nil {
 				return err
 			}
-			if modified {
-				if err = a.OverwriteConfig(a.Config); err != nil {
+
+			var clientSrc, clientDst string
+			if path.Src.ChainID == src.ChainID() {
+				clientSrc = clientID
+			} else {
+				clientDst = clientID
+			}
+
+			if clientID != "" {
+				if err = a.updatePathConfig(cmd.Context(), pathName, clientSrc, clientDst, "", ""); err != nil {
 					return err
 				}
 			}
@@ -215,9 +288,10 @@ func createClientCmd(a *appState) *cobra.Command {
 		},
 	}
 
-	cmd = clientParameterFlags(a.Viper, cmd)
-	cmd = overrideFlag(a.Viper, cmd)
-	cmd = memoFlag(a.Viper, cmd)
+	cmd = clientParameterFlags(a.viper, cmd)
+	cmd = clientUnbondingPeriodFlag(a.viper, cmd)
+	cmd = overrideFlag(a.viper, cmd)
+	cmd = memoFlag(a.viper, cmd)
 	return cmd
 }
 
@@ -231,7 +305,7 @@ corresponding update-client messages.`,
 		Args:    withUsage(cobra.ExactArgs(1)),
 		Example: strings.TrimSpace(fmt.Sprintf(`$ %s transact update-clients demo-path`, appName)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, src, dst, err := a.Config.ChainsFromPath(args[0])
+			c, src, dst, err := a.config.ChainsFromPath(args[0])
 			if err != nil {
 				return err
 			}
@@ -240,15 +314,16 @@ corresponding update-client messages.`,
 			if exists := c[src].ChainProvider.KeyExists(c[src].ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on src chain %s", c[src].ChainProvider.Key(), c[src].ChainID())
 			}
+
 			if exists := c[dst].ChainProvider.KeyExists(c[dst].ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on dst chain %s", c[dst].ChainProvider.Key(), c[dst].ChainID())
 			}
 
-			return relayer.UpdateClients(cmd.Context(), c[src], c[dst], a.Config.memo(cmd))
+			return relayer.UpdateClients(cmd.Context(), c[src], c[dst], a.config.memo(cmd))
 		},
 	}
 
-	return memoFlag(a.Viper, cmd)
+	return memoFlag(a.viper, cmd)
 }
 
 func upgradeClientsCmd(a *appState) *cobra.Command {
@@ -257,7 +332,7 @@ func upgradeClientsCmd(a *appState) *cobra.Command {
 		Short: "upgrades IBC clients between two configured chains with a configured path and chain-id",
 		Args:  withUsage(cobra.ExactArgs(2)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, src, dst, err := a.Config.ChainsFromPath(args[0])
+			c, src, dst, err := a.config.ChainsFromPath(args[0])
 			if err != nil {
 				return err
 			}
@@ -271,13 +346,14 @@ func upgradeClientsCmd(a *appState) *cobra.Command {
 			if exists := c[src].ChainProvider.KeyExists(c[src].ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on src chain %s", c[src].ChainProvider.Key(), c[src].ChainID())
 			}
+
 			if exists := c[dst].ChainProvider.KeyExists(c[dst].ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on dst chain %s", c[dst].ChainProvider.Key(), c[dst].ChainID())
 			}
 
 			targetChainID := args[1]
 
-			memo := a.Config.memo(cmd)
+			memo := a.config.memo(cmd)
 
 			// send the upgrade message on the targetChainID
 			if src == targetChainID {
@@ -288,8 +364,8 @@ func upgradeClientsCmd(a *appState) *cobra.Command {
 		},
 	}
 
-	cmd = heightFlag(a.Viper, cmd)
-	cmd = memoFlag(a.Viper, cmd)
+	cmd = heightFlag(a.viper, cmd)
+	cmd = memoFlag(a.viper, cmd)
 	return cmd
 }
 
@@ -297,7 +373,7 @@ func createConnectionCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "connection path_name",
 		Aliases: []string{"conn"},
-		Short:   "create a connection between two configured chains with a configured path",
+		Short:   "create a connection between two configured chains with a configured path; if existing client does not exist, it will create one",
 		Long: strings.TrimSpace(`Create or repair a connection between two IBC-connected networks
 along a specific path.`,
 		),
@@ -323,9 +399,14 @@ $ %s tx conn demo-path --timeout 5s`,
 				return err
 			}
 
+			customClientTrustingPeriodPercentage, err := cmd.Flags().GetInt64(flagClientTrustingPeriodPercentage)
+			if err != nil {
+				return err
+			}
+
 			pathName := args[0]
 
-			c, src, dst, err := a.Config.ChainsFromPath(pathName)
+			c, src, dst, err := a.config.ChainsFromPath(pathName)
 			if err != nil {
 				return err
 			}
@@ -345,15 +426,21 @@ $ %s tx conn demo-path --timeout 5s`,
 				return err
 			}
 
+			maxClockDrift, err := cmd.Flags().GetDuration(flagMaxClockDrift)
+			if err != nil {
+				return err
+			}
+
 			// ensure that keys exist
 			if exists := c[src].ChainProvider.KeyExists(c[src].ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on src chain %s", c[src].ChainProvider.Key(), c[src].ChainID())
 			}
+
 			if exists := c[dst].ChainProvider.KeyExists(c[dst].ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on dst chain %s", c[dst].ChainProvider.Key(), c[dst].ChainID())
 			}
 
-			memo := a.Config.memo(cmd)
+			memo := a.config.memo(cmd)
 
 			initialBlockHistory, err := cmd.Flags().GetUint64(flagInitialBlockHistory)
 			if err != nil {
@@ -361,22 +448,42 @@ $ %s tx conn demo-path --timeout 5s`,
 			}
 
 			// ensure that the clients exist
-			modified, err := c[src].CreateClients(cmd.Context(), c[dst], allowUpdateAfterExpiry, allowUpdateAfterMisbehaviour, override, customClientTrustingPeriod, memo)
+			clientSrc, clientDst, err := c[src].CreateClients(
+				cmd.Context(),
+				c[dst],
+				allowUpdateAfterExpiry,
+				allowUpdateAfterMisbehaviour,
+				override,
+				customClientTrustingPeriod,
+				maxClockDrift,
+				customClientTrustingPeriodPercentage,
+				memo,
+			)
 			if err != nil {
 				return err
 			}
-			if modified {
-				if err := a.OverwriteConfig(a.Config); err != nil {
+
+			if clientSrc != "" || clientDst != "" {
+				if err := a.updatePathConfig(cmd.Context(), pathName, clientSrc, clientDst, "", ""); err != nil {
 					return err
 				}
 			}
 
-			modified, err = c[src].CreateOpenConnections(cmd.Context(), c[dst], retries, to, memo, initialBlockHistory, pathName)
+			connectionSrc, connectionDst, err := c[src].CreateOpenConnections(
+				cmd.Context(),
+				c[dst],
+				retries,
+				to,
+				memo,
+				initialBlockHistory,
+				pathName,
+			)
 			if err != nil {
 				return err
 			}
-			if modified {
-				if err := a.OverwriteConfig(a.Config); err != nil {
+
+			if connectionSrc != "" || connectionDst != "" {
+				if err := a.updatePathConfig(cmd.Context(), pathName, "", "", connectionSrc, connectionDst); err != nil {
 					return err
 				}
 			}
@@ -385,12 +492,12 @@ $ %s tx conn demo-path --timeout 5s`,
 		},
 	}
 
-	cmd = timeoutFlag(a.Viper, cmd)
-	cmd = retryFlag(a.Viper, cmd)
-	cmd = clientParameterFlags(a.Viper, cmd)
-	cmd = overrideFlag(a.Viper, cmd)
-	cmd = memoFlag(a.Viper, cmd)
-	cmd = initBlockFlag(a.Viper, cmd)
+	cmd = timeoutFlag(a.viper, cmd)
+	cmd = retryFlag(a.viper, cmd)
+	cmd = clientParameterFlags(a.viper, cmd)
+	cmd = overrideFlag(a.viper, cmd)
+	cmd = memoFlag(a.viper, cmd)
+	cmd = initBlockFlag(a.viper, cmd)
 	return cmd
 }
 
@@ -398,7 +505,8 @@ func createChannelCmd(a *appState) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "channel path_name",
 		Aliases: []string{"chan"},
-		Short:   "create a channel between two configured chains with a configured path using specified or default channel identifiers",
+		Short: "create a channel between two configured chains with a configured path using specified or " +
+			"default channel identifiers",
 		Long: strings.TrimSpace(`Create or repair a channel between two IBC-connected networks
 along a specific path.`,
 		),
@@ -409,10 +517,9 @@ $ %s tx chan demo-path --timeout 5s --max-retries 10`,
 			appName, appName,
 		)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-
 			pathName := args[0]
 
-			c, src, dst, err := a.Config.ChainsFromPath(pathName)
+			c, src, dst, err := a.config.ChainsFromPath(pathName)
 			if err != nil {
 				return err
 			}
@@ -456,20 +563,33 @@ $ %s tx chan demo-path --timeout 5s --max-retries 10`,
 			if exists := c[src].ChainProvider.KeyExists(c[src].ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on src chain %s", c[src].ChainProvider.Key(), c[src].ChainID())
 			}
+
 			if exists := c[dst].ChainProvider.KeyExists(c[dst].ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on dst chain %s", c[dst].ChainProvider.Key(), c[dst].ChainID())
 			}
 
 			// create channel if it isn't already created
-			return c[src].CreateOpenChannels(cmd.Context(), c[dst], retries, to, srcPort, dstPort, order, version, override, a.Config.memo(cmd), pathName)
+			return c[src].CreateOpenChannels(
+				cmd.Context(),
+				c[dst],
+				retries,
+				to,
+				srcPort,
+				dstPort,
+				order,
+				version,
+				override,
+				a.config.memo(cmd),
+				pathName,
+			)
 		},
 	}
 
-	cmd = timeoutFlag(a.Viper, cmd)
-	cmd = retryFlag(a.Viper, cmd)
-	cmd = overrideFlag(a.Viper, cmd)
-	cmd = channelParameterFlags(a.Viper, cmd)
-	cmd = memoFlag(a.Viper, cmd)
+	cmd = timeoutFlag(a.viper, cmd)
+	cmd = retryFlag(a.viper, cmd)
+	cmd = overrideFlag(a.viper, cmd)
+	cmd = channelParameterFlags(a.viper, cmd)
+	cmd = memoFlag(a.viper, cmd)
 	return cmd
 }
 
@@ -488,7 +608,7 @@ $ %s tx channel-close demo-path channel-0 transfer -o 3s`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pathName := args[0]
 
-			c, src, dst, err := a.Config.ChainsFromPath(pathName)
+			c, src, dst, err := a.config.ChainsFromPath(pathName)
 			if err != nil {
 				return err
 			}
@@ -510,6 +630,7 @@ $ %s tx channel-close demo-path channel-0 transfer -o 3s`,
 			if exists := c[src].ChainProvider.KeyExists(c[src].ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on src chain %s", c[src].ChainProvider.Key(), c[src].ChainID())
 			}
+
 			if exists := c[dst].ChainProvider.KeyExists(c[dst].ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on dst chain %s", c[dst].ChainProvider.Key(), c[dst].ChainID())
 			}
@@ -524,13 +645,13 @@ $ %s tx channel-close demo-path channel-0 transfer -o 3s`,
 				return err
 			}
 
-			return c[src].CloseChannel(cmd.Context(), c[dst], retries, to, channelID, portID, a.Config.memo(cmd), pathName)
+			return c[src].CloseChannel(cmd.Context(), c[dst], retries, to, channelID, portID, a.config.memo(cmd), pathName)
 		},
 	}
 
-	cmd = timeoutFlag(a.Viper, cmd)
-	cmd = retryFlag(a.Viper, cmd)
-	cmd = memoFlag(a.Viper, cmd)
+	cmd = timeoutFlag(a.viper, cmd)
+	cmd = retryFlag(a.viper, cmd)
+	cmd = memoFlag(a.viper, cmd)
 	return cmd
 }
 
@@ -565,15 +686,20 @@ $ %s tx connect demo-path --src-port transfer --dst-port transfer --order unorde
 				return err
 			}
 
+			customClientTrustingPeriodPercentage, err := cmd.Flags().GetInt64(flagClientTrustingPeriodPercentage)
+			if err != nil {
+				return err
+			}
+
 			pathName := args[0]
 
-			pth, err := a.Config.Paths.Get(pathName)
+			pth, err := a.config.Paths.Get(pathName)
 			if err != nil {
 				return err
 			}
 
 			src, dst := pth.Src.ChainID, pth.Dst.ChainID
-			c, err := a.Config.Chains.Gets(src, dst)
+			c, err := a.config.Chains.Gets(src, dst)
 			if err != nil {
 				return err
 			}
@@ -616,15 +742,21 @@ $ %s tx connect demo-path --src-port transfer --dst-port transfer --order unorde
 				return err
 			}
 
+			maxClockDrift, err := cmd.Flags().GetDuration(flagMaxClockDrift)
+			if err != nil {
+				return err
+			}
+
 			// ensure that keys exist
 			if exists := c[src].ChainProvider.KeyExists(c[src].ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on src chain %s", c[src].ChainProvider.Key(), c[src].ChainID())
 			}
+
 			if exists := c[dst].ChainProvider.KeyExists(c[dst].ChainProvider.Key()); !exists {
 				return fmt.Errorf("key %s not found on dst chain %s", c[dst].ChainProvider.Key(), c[dst].ChainID())
 			}
 
-			memo := a.Config.memo(cmd)
+			memo := a.config.memo(cmd)
 
 			initialBlockHistory, err := cmd.Flags().GetUint64(flagInitialBlockHistory)
 			if err != nil {
@@ -632,38 +764,70 @@ $ %s tx connect demo-path --src-port transfer --dst-port transfer --order unorde
 			}
 
 			// create clients if they aren't already created
-			modified, err := c[src].CreateClients(cmd.Context(), c[dst], allowUpdateAfterExpiry, allowUpdateAfterMisbehaviour, override, customClientTrustingPeriod, memo)
+			clientSrc, clientDst, err := c[src].CreateClients(
+				cmd.Context(),
+				c[dst],
+				allowUpdateAfterExpiry,
+				allowUpdateAfterMisbehaviour,
+				override,
+				customClientTrustingPeriod,
+				maxClockDrift,
+				customClientTrustingPeriodPercentage,
+				memo,
+			)
 			if err != nil {
 				return fmt.Errorf("error creating clients: %w", err)
 			}
-			if modified {
-				if err := a.OverwriteConfig(a.Config); err != nil {
+
+			if clientSrc != "" || clientDst != "" {
+				if err := a.updatePathConfig(cmd.Context(), pathName, clientSrc, clientDst, "", ""); err != nil {
 					return err
 				}
 			}
 
 			// create connection if it isn't already created
-			modified, err = c[src].CreateOpenConnections(cmd.Context(), c[dst], retries, to, memo, initialBlockHistory, pathName)
+			connectionSrc, connectionDst, err := c[src].CreateOpenConnections(
+				cmd.Context(),
+				c[dst],
+				retries,
+				to,
+				memo,
+				initialBlockHistory,
+				pathName,
+			)
 			if err != nil {
 				return fmt.Errorf("error creating connections: %w", err)
 			}
-			if modified {
-				if err := a.OverwriteConfig(a.Config); err != nil {
+
+			if connectionSrc != "" || connectionDst != "" {
+				if err := a.updatePathConfig(cmd.Context(), pathName, "", "", connectionSrc, connectionDst); err != nil {
 					return err
 				}
 			}
 
 			// create channel if it isn't already created
-			return c[src].CreateOpenChannels(cmd.Context(), c[dst], retries, to, srcPort, dstPort, order, version, override, memo, pathName)
+			return c[src].CreateOpenChannels(
+				cmd.Context(),
+				c[dst],
+				retries,
+				to,
+				srcPort,
+				dstPort,
+				order,
+				version,
+				override,
+				memo,
+				pathName,
+			)
 		},
 	}
-	cmd = timeoutFlag(a.Viper, cmd)
-	cmd = retryFlag(a.Viper, cmd)
-	cmd = clientParameterFlags(a.Viper, cmd)
-	cmd = channelParameterFlags(a.Viper, cmd)
-	cmd = overrideFlag(a.Viper, cmd)
-	cmd = memoFlag(a.Viper, cmd)
-	cmd = initBlockFlag(a.Viper, cmd)
+	cmd = timeoutFlag(a.viper, cmd)
+	cmd = retryFlag(a.viper, cmd)
+	cmd = clientParameterFlags(a.viper, cmd)
+	cmd = channelParameterFlags(a.viper, cmd)
+	cmd = overrideFlag(a.viper, cmd)
+	cmd = memoFlag(a.viper, cmd)
+	cmd = initBlockFlag(a.viper, cmd)
 	return cmd
 }
 
@@ -683,7 +847,7 @@ $ %s tx link-then-start demo-path --timeout 5s`, appName, appName)),
 			lCmd := linkCmd(a)
 
 			for err := lCmd.RunE(cmd, args); err != nil; err = lCmd.RunE(cmd, args) {
-				a.Log.Info("Error running link; retrying", zap.Error(err))
+				a.log.Info("Error running link; retrying", zap.Error(err))
 				select {
 				case <-time.After(time.Second):
 					// Keep going.
@@ -697,13 +861,134 @@ $ %s tx link-then-start demo-path --timeout 5s`, appName, appName)),
 		},
 	}
 
-	cmd = timeoutFlag(a.Viper, cmd)
-	cmd = retryFlag(a.Viper, cmd)
-	cmd = strategyFlag(a.Viper, cmd)
-	cmd = clientParameterFlags(a.Viper, cmd)
-	cmd = channelParameterFlags(a.Viper, cmd)
-	cmd = overrideFlag(a.Viper, cmd)
-	cmd = memoFlag(a.Viper, cmd)
+	cmd = timeoutFlag(a.viper, cmd)
+	cmd = retryFlag(a.viper, cmd)
+	cmd = strategyFlag(a.viper, cmd)
+	cmd = clientParameterFlags(a.viper, cmd)
+	cmd = channelParameterFlags(a.viper, cmd)
+	cmd = overrideFlag(a.viper, cmd)
+	cmd = memoFlag(a.viper, cmd)
+	cmd = debugServerFlags(a.viper, cmd)
+	cmd = initBlockFlag(a.viper, cmd)
+	cmd = processorFlag(a.viper, cmd)
+	cmd = updateTimeFlags(a.viper, cmd)
+	cmd = flushIntervalFlag(a.viper, cmd)
+	return cmd
+}
+
+func flushCmd(a *appState) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "flush [path_name]? [src_channel_id]?",
+		Aliases: []string{"relay-pkts"},
+		Short:   "flush any pending MsgRecvPacket and MsgAcknowledgement messages on a given path, in both directions",
+		Args:    withUsage(cobra.RangeArgs(0, 2)),
+		Example: strings.TrimSpace(fmt.Sprintf(`
+$ %s tx flush
+$ %s tx flush demo-path
+$ %s tx flush demo-path channel-0`,
+			appName, appName, appName,
+		)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			chains := make(map[string]*relayer.Chain)
+			var paths []relayer.NamedPath
+
+			if len(args) > 0 {
+				pathName := args[0]
+				path := a.config.Paths.MustGet(pathName)
+				paths = append(paths, relayer.NamedPath{
+					Name: pathName,
+					Path: path,
+				})
+
+				// collect unique chain IDs
+				chains[path.Src.ChainID] = nil
+				chains[path.Dst.ChainID] = nil
+			} else {
+				for n, path := range a.config.Paths {
+					paths = append(paths, relayer.NamedPath{
+						Name: n,
+						Path: path,
+					})
+
+					// collect unique chain IDs
+					chains[path.Src.ChainID] = nil
+					chains[path.Dst.ChainID] = nil
+				}
+			}
+
+			chainIDs := make([]string, 0, len(chains))
+			for chainID := range chains {
+				chainIDs = append(chainIDs, chainID)
+			}
+
+			// get chain configurations
+			chains, err := a.config.Chains.Gets(chainIDs...)
+			if err != nil {
+				return err
+			}
+
+			if err := ensureKeysExist(chains); err != nil {
+				return err
+			}
+
+			maxMsgLength, err := cmd.Flags().GetUint64(flagMaxMsgLength)
+			if err != nil {
+				return err
+			}
+
+			if len(args) == 2 {
+				// Only allow specific channel
+				paths[0].Path.Filter = relayer.ChannelFilter{
+					Rule:        processor.RuleAllowList,
+					ChannelList: []string{args[1]},
+				}
+			}
+
+			stuckPacket, err := parseStuckPacketFromFlags(cmd)
+			if err != nil {
+				return err
+			}
+
+			ctx, cancel := context.WithTimeout(cmd.Context(), flushTimeout)
+			defer cancel()
+
+			rlyErrCh := relayer.StartRelayer(
+				ctx,
+				a.log,
+				chains,
+				paths,
+				maxMsgLength,
+				a.config.Global.MaxReceiverSize,
+				a.config.Global.ICS20MemoLimit,
+				a.config.memo(cmd),
+				0,
+				0,
+				&processor.FlushLifecycle{},
+				relayer.ProcessorEvents,
+				0,
+				nil,
+				stuckPacket,
+			)
+
+			// Block until the error channel sends a message.
+			// The context being canceled will cause the relayer to stop,
+			// so we don't want to separately monitor the ctx.Done channel,
+			// because we would risk returning before the relayer cleans up.
+			if err := <-rlyErrCh; err != nil && !errors.Is(err, context.Canceled) {
+				a.log.Warn(
+					"Relayer start error",
+					zap.Error(err),
+				)
+				return err
+			}
+			return nil
+		},
+	}
+
+	cmd = strategyFlag(a.viper, cmd)
+	cmd = memoFlag(a.viper, cmd)
+	cmd = stuckPacketFlags(a.viper, cmd)
+
 	return cmd
 }
 
@@ -719,38 +1004,13 @@ $ %s tx relay-pkts demo-path channel-0`,
 			appName, appName,
 		)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, src, dst, err := a.Config.ChainsFromPath(args[0])
-			if err != nil {
-				return err
-			}
-
-			if err = ensureKeysExist(c); err != nil {
-				return err
-			}
-
-			maxTxSize, maxMsgLength, err := GetStartOptions(cmd)
-			if err != nil {
-				return err
-			}
-
-			channelID := args[1]
-			channel, err := relayer.QueryChannel(cmd.Context(), c[src], channelID)
-			if err != nil {
-				return err
-			}
-
-			sp := relayer.UnrelayedSequences(cmd.Context(), c[src], c[dst], channel)
-
-			if err = relayer.RelayPackets(cmd.Context(), a.Log, c[src], c[dst], sp, maxTxSize, maxMsgLength, a.Config.memo(cmd), channel); err != nil {
-				return err
-			}
-
-			return nil
+			a.log.Warn("This command is deprecated. Please use 'tx flush' command instead")
+			return flushCmd(a).RunE(cmd, args)
 		},
 	}
 
-	cmd = strategyFlag(a.Viper, cmd)
-	cmd = memoFlag(a.Viper, cmd)
+	cmd = strategyFlag(a.viper, cmd)
+	cmd = memoFlag(a.viper, cmd)
 	return cmd
 }
 
@@ -766,40 +1026,13 @@ $ %s tx relay-acks demo-path channel-0 -l 3 -s 6`,
 			appName, appName,
 		)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, src, dst, err := a.Config.ChainsFromPath(args[0])
-			if err != nil {
-				return err
-			}
-
-			if err = ensureKeysExist(c); err != nil {
-				return err
-			}
-
-			maxTxSize, maxMsgLength, err := GetStartOptions(cmd)
-			if err != nil {
-				return err
-			}
-
-			channelID := args[1]
-			channel, err := relayer.QueryChannel(cmd.Context(), c[src], channelID)
-			if err != nil {
-				return err
-			}
-
-			// sp.Src contains all sequences acked on SRC but acknowledgement not processed on DST
-			// sp.Dst contains all sequences acked on DST but acknowledgement not processed on SRC
-			sp := relayer.UnrelayedAcknowledgements(cmd.Context(), c[src], c[dst], channel)
-
-			if err = relayer.RelayAcknowledgements(cmd.Context(), a.Log, c[src], c[dst], sp, maxTxSize, maxMsgLength, a.Config.memo(cmd), channel); err != nil {
-				return err
-			}
-
-			return nil
+			a.log.Warn("This command is deprecated. Please use 'tx flush' command instead")
+			return flushCmd(a).RunE(cmd, args)
 		},
 	}
 
-	cmd = strategyFlag(a.Viper, cmd)
-	cmd = memoFlag(a.Viper, cmd)
+	cmd = strategyFlag(a.viper, cmd)
+	cmd = memoFlag(a.viper, cmd)
 	return cmd
 }
 
@@ -817,11 +1050,12 @@ $ %s tx transfer ibc-0 ibc-1 100000stake raw:non-bech32-address channel-0 --path
 $ %s tx raw send ibc-0 ibc-1 100000stake cosmos1skjwj5whet0lpe65qaq4rpq03hjxlwd9nf39lk channel-0 --path demo -c 5
 `, appName, appName, appName, appName)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			src, ok := a.Config.Chains[args[0]]
+			src, ok := a.config.Chains[args[0]]
 			if !ok {
 				return errChainNotFound(args[0])
 			}
-			dst, ok := a.Config.Chains[args[1]]
+
+			dst, ok := a.config.Chains[args[1]]
 			if !ok {
 				return errChainNotFound(args[1])
 			}
@@ -850,11 +1084,12 @@ $ %s tx raw send ibc-0 ibc-1 100000stake cosmos1skjwj5whet0lpe65qaq4rpq03hjxlwd9
 			srcChannelID := args[4]
 
 			var pathConnectionID string
-			if src.ChainID() == path.Src.ChainID {
+			switch {
+			case src.ChainID() == path.Src.ChainID:
 				pathConnectionID = path.Src.ConnectionID
-			} else if src.ChainID() == path.Dst.ChainID {
+			case src.ChainID() == path.Dst.ChainID:
 				pathConnectionID = path.Dst.ConnectionID
-			} else {
+			default:
 				return fmt.Errorf("no path configured using chain-id: %s", src.ChainID())
 			}
 
@@ -907,16 +1142,29 @@ $ %s tx raw send ibc-0 ibc-1 100000stake cosmos1skjwj5whet0lpe65qaq4rpq03hjxlwd9
 				dstAddr = rawDstAddr
 			}
 
-			return src.SendTransferMsg(cmd.Context(), a.Log, dst, amount, dstAddr, toHeightOffset, toTimeOffset, srcChannel)
+			memo := a.config.memo(cmd)
+
+			return src.SendTransferMsg(
+				cmd.Context(),
+				a.log,
+				dst,
+				amount,
+				dstAddr,
+				memo,
+				toHeightOffset,
+				toTimeOffset,
+				srcChannel,
+			)
 		},
 	}
 
-	return timeoutFlags(a.Viper, pathFlag(a.Viper, cmd))
+	cmd = memoFlag(a.viper, cmd)
+	return timeoutFlags(a.viper, pathFlag(a.viper, cmd))
 }
 
 func setPathsFromArgs(a *appState, src, dst *relayer.Chain, name string) (*relayer.Path, error) {
 	// find any configured paths between the chains
-	paths, err := a.Config.Paths.PathsFromChains(src.ChainID(), dst.ChainID())
+	paths, err := a.config.Paths.PathsFromChains(src.ChainID(), dst.ChainID())
 	if err != nil {
 		return nil, err
 	}
@@ -964,4 +1212,45 @@ func ensureKeysExist(chains map[string]*relayer.Chain) error {
 	}
 
 	return nil
+}
+
+// MsgRegisterCounterpartyPayee registers the counterparty_payee
+func registerCounterpartyCmd(a *appState) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "register-counterparty chain_name channel_id port_id relay_addr counterparty_payee",
+		Aliases: []string{"reg-cpt"},
+		Short:   "register the counterparty relayer address for ics-29 fee middleware",
+		Args:    withUsage(cobra.MatchAll(cobra.ExactArgs(5))),
+		Example: strings.TrimSpace(fmt.Sprintf(`
+$ %s register-counterparty channel-1 transfer cosmos1skjwj5whet0lpe65qaq4rpq03hjxlwd9nf39lk 
+juno1g0ny488ws4064mjjxk4keenwfjrthn503ngjxd
+$ %s reg-cpt channel-1 cosmos1skjwj5whet0lpe65qaq4rpq03hjxlwd9nf39lk juno1g0ny488ws4064mjjxk4keenwfjrthn503ngjxd`,
+			appName, appName)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			chain, ok := a.config.Chains[args[0]]
+			if !ok {
+				return errChainNotFound(args[0])
+			}
+
+			channelID := args[1]
+			portID := args[2]
+
+			relayerAddr := args[3]
+			counterpartyPayee := args[4]
+
+			msg, err := chain.ChainProvider.MsgRegisterCounterpartyPayee(portID, channelID, relayerAddr, counterpartyPayee)
+			if err != nil {
+				return err
+			}
+
+			memo := a.config.memo(cmd)
+
+			res, success, err := chain.ChainProvider.SendMessage(cmd.Context(), msg, memo)
+			fmt.Println(res, success, err)
+
+			return nil
+		},
+	}
+
+	return memoFlag(a.viper, cmd)
 }

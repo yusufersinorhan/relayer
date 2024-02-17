@@ -3,8 +3,8 @@ package cosmos
 import (
 	"testing"
 
-	conntypes "github.com/cosmos/ibc-go/v5/modules/core/03-connection/types"
-	chantypes "github.com/cosmos/ibc-go/v5/modules/core/04-channel/types"
+	conntypes "github.com/cosmos/ibc-go/v8/modules/core/03-connection/types"
+	chantypes "github.com/cosmos/ibc-go/v8/modules/core/04-channel/types"
 	"github.com/cosmos/relayer/v2/relayer/processor"
 	"github.com/cosmos/relayer/v2/relayer/provider"
 	"github.com/stretchr/testify/require"
@@ -34,7 +34,7 @@ func TestConnectionStateCache(t *testing.T) {
 		// will populate the connectionStateCache with a key that has an empty counterparty connection ID.
 		// The MsgConnectionOpenTry needs to replace this key with a key that has the counterparty connection ID.
 
-		ccp := NewCosmosChainProcessor(zap.NewNop(), &CosmosProvider{})
+		ccp := NewCosmosChainProcessor(zap.NewNop(), &CosmosProvider{}, nil)
 		c := processor.NewIBCMessagesCache()
 
 		// Observe MsgConnectionOpenInit, which does not have counterparty connection ID.
@@ -67,7 +67,7 @@ func TestConnectionStateCache(t *testing.T) {
 		// We need to make sure that the connectionStateCache does not have two keys for the same connection,
 		// i.e. one key with the counterparty connection ID, and one without.
 
-		ccp := NewCosmosChainProcessor(zap.NewNop(), &CosmosProvider{})
+		ccp := NewCosmosChainProcessor(zap.NewNop(), &CosmosProvider{}, nil)
 		c := processor.NewIBCMessagesCache()
 
 		// Initialize connectionStateCache with populated connection ID and counterparty connection ID.
@@ -118,7 +118,7 @@ func TestChannelStateCache(t *testing.T) {
 		// will populate the channelStateCache with a key that has an empty counterparty channel ID.
 		// The MsgChannelOpenTry needs to replace this key with a key that has the counterparty channel ID.
 
-		ccp := NewCosmosChainProcessor(zap.NewNop(), &CosmosProvider{})
+		ccp := NewCosmosChainProcessor(zap.NewNop(), &CosmosProvider{}, nil)
 		c := processor.NewIBCMessagesCache()
 
 		// Observe MsgChannelOpenInit, which does not have counterparty channel ID.
@@ -128,7 +128,7 @@ func TestChannelStateCache(t *testing.T) {
 
 		// The channel state is not open, but the entry should exist in the channelStateCache.
 		// MsgInitKey returns the ChannelKey with an empty counterparty channel ID.
-		require.False(t, ccp.channelStateCache[k.MsgInitKey()])
+		require.False(t, ccp.channelStateCache[k.MsgInitKey()].Open)
 
 		// Observe MsgChannelOpenAck, which does have counterparty channel ID.
 		ccp.handleChannelMessage(chantypes.EventTypeChannelOpenAck, msgOpenAck, c)
@@ -139,7 +139,7 @@ func TestChannelStateCache(t *testing.T) {
 
 		// The fully populated ChannelKey should now be the only entry for this channel.
 		// The channel now open.
-		require.True(t, ccp.channelStateCache[k])
+		require.True(t, ccp.channelStateCache[k].Open)
 	})
 
 	t.Run("handshake already occurred", func(t *testing.T) {
@@ -151,12 +151,12 @@ func TestChannelStateCache(t *testing.T) {
 		// We need to make sure that the channelStateCache does not have two keys for the same channel,
 		// i.e. one key with the counterparty channel ID, and one without.
 
-		ccp := NewCosmosChainProcessor(zap.NewNop(), &CosmosProvider{})
+		ccp := NewCosmosChainProcessor(zap.NewNop(), &CosmosProvider{}, nil)
 		c := processor.NewIBCMessagesCache()
 
 		// Initialize channelStateCache with populated channel ID and counterparty channel ID.
 		// This emulates initializeChannelState after a recent channel handshake has completed
-		ccp.channelStateCache[k] = true
+		ccp.channelStateCache.SetOpen(k, true, chantypes.NONE)
 
 		// Observe MsgChannelOpenInit, which does not have counterparty channel ID.
 		ccp.handleChannelMessage(chantypes.EventTypeChannelOpenInit, msgOpenInit, c)
@@ -166,7 +166,7 @@ func TestChannelStateCache(t *testing.T) {
 
 		// The fully populated ChannelKey should still be the only entry for this channel.
 		// The channel is still marked open since it was open during initializeChannelState.
-		require.True(t, ccp.channelStateCache[k])
+		require.True(t, ccp.channelStateCache[k].Open)
 
 		// Observe MsgChannelOpenAck, which does have counterparty channel ID.
 		ccp.handleChannelMessage(chantypes.EventTypeChannelOpenAck, msgOpenAck, c)
@@ -175,6 +175,6 @@ func TestChannelStateCache(t *testing.T) {
 		require.Len(t, ccp.channelStateCache, 1)
 
 		// The fully populated ChannelKey should still be the only entry for this channel.
-		require.True(t, ccp.channelStateCache[k])
+		require.True(t, ccp.channelStateCache[k].Open)
 	})
 }

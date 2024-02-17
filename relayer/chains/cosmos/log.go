@@ -1,13 +1,17 @@
 package cosmos
 
 import (
+	"errors"
 	"reflect"
 
-	"github.com/cosmos/cosmos-sdk/codec/types"
+	"github.com/cosmos/cosmos-sdk/codec"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	typestx "github.com/cosmos/cosmos-sdk/types/tx"
-	transfertypes "github.com/cosmos/ibc-go/v5/modules/apps/transfer/types"
-	clienttypes "github.com/cosmos/ibc-go/v5/modules/core/02-client/types"
+	feetypes "github.com/cosmos/ibc-go/v8/modules/apps/29-fee/types"
+	transfertypes "github.com/cosmos/ibc-go/v8/modules/apps/transfer/types"
+
+	clienttypes "github.com/cosmos/ibc-go/v8/modules/core/02-client/types"
+	chantypes "github.com/cosmos/ibc-go/v8/modules/core/04-channel/types"
 	"github.com/cosmos/relayer/v2/relayer/provider"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -52,6 +56,12 @@ func (cc *CosmosProvider) LogFailedTx(res *provider.RelayerTxResponse, err error
 	fields = append(fields, msgTypesField(msgs))
 
 	if err != nil {
+
+		if errors.Is(err, chantypes.ErrRedundantTx) {
+			cc.log.Debug("Redundant message(s)", fields...)
+			return
+		}
+
 		// Make a copy since we may continue to the warning
 		errorFields := append(fields, zap.Error(err))
 		cc.log.Error(
@@ -64,7 +74,10 @@ func (cc *CosmosProvider) LogFailedTx(res *provider.RelayerTxResponse, err error
 		}
 	}
 
-	if res.Code != 0 && res.Data != "" {
+	if res.Code != 0 {
+		if sdkErr := cc.sdkError(res.Codespace, res.Code); err != nil {
+			fields = append(fields, zap.NamedError("sdk_error", sdkErr))
+		}
 		fields = append(fields, zap.Object("response", res))
 		cc.log.Warn(
 			"Sent transaction but received failure response",
@@ -88,12 +101,13 @@ func (cc *CosmosProvider) LogSuccessTx(res *sdk.TxResponse, msgs []provider.Rela
 	fields = append(fields, zap.Int64("gas_used", res.GasUsed))
 
 	// Extract fees and fee_payer if present
-	ir := types.NewInterfaceRegistry()
+	cdc := codec.NewProtoCodec(cc.Cdc.InterfaceRegistry)
+
 	var m sdk.Msg
-	if err := ir.UnpackAny(res.Tx, &m); err == nil {
+	if err := cc.Cdc.InterfaceRegistry.UnpackAny(res.Tx, &m); err == nil {
 		if tx, ok := m.(*typestx.Tx); ok {
 			fields = append(fields, zap.Stringer("fees", tx.GetFee()))
-			if feePayer := getFeePayer(tx); feePayer != "" {
+			if feePayer := getFeePayer(cc.log, cdc, tx); feePayer != "" {
 				fields = append(fields, zap.String("fee_payer", feePayer))
 			}
 		} else {
@@ -113,7 +127,7 @@ func (cc *CosmosProvider) LogSuccessTx(res *sdk.TxResponse, msgs []provider.Rela
 		zap.String("tx_hash", res.TxHash),
 	)
 
-	// Log the succesful transaction with fields
+	// Log the successful transaction with fields
 	cc.log.Info(
 		"Successful transaction",
 		fields...,
@@ -131,7 +145,7 @@ func msgTypesField(msgs []provider.RelayerMessage) zap.Field {
 // getFeePayer returns the bech32 address of the fee payer of a transaction.
 // This uses the fee payer field if set,
 // otherwise falls back to the address of whoever signed the first message.
-func getFeePayer(tx *typestx.Tx) string {
+func getFeePayer(log *zap.Logger, cdc *codec.ProtoCodec, tx *typestx.Tx) string {
 	payer := tx.AuthInfo.Fee.Payer
 	if payer != "" {
 		return payer
@@ -151,7 +165,26 @@ func getFeePayer(tx *typestx.Tx) string {
 	case *clienttypes.MsgUpdateClient:
 		// Same failure mode as MsgCreateClient.
 		return firstMsg.Signer
+	case *clienttypes.MsgUpgradeClient:
+		return firstMsg.Signer
+	case *clienttypes.MsgSubmitMisbehaviour:
+		// Same failure mode as MsgCreateClient.
+		return firstMsg.Signer
+	case *feetypes.MsgRegisterPayee:
+		return firstMsg.Relayer
+	case *feetypes.MsgRegisterCounterpartyPayee:
+		return firstMsg.Relayer
+	case *feetypes.MsgPayPacketFee:
+		return firstMsg.Signer
+	case *feetypes.MsgPayPacketFeeAsync:
+		return firstMsg.PacketFee.RefundAddress
 	default:
-		return firstMsg.GetSigners()[0].String()
+		signers, _, err := cdc.GetMsgV1Signers(firstMsg)
+		if err != nil {
+			log.Info("Could not get signers for msg when attempting to get the fee payer", zap.Error(err))
+			return ""
+		}
+
+		return string(signers[0])
 	}
 }

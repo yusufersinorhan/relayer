@@ -1,14 +1,23 @@
 package processor
 
 import (
-	"strconv"
+	"context"
+	"encoding/base64"
+	"fmt"
 	"strings"
 	"sync"
 
-	chantypes "github.com/cosmos/ibc-go/v5/modules/core/04-channel/types"
+	conntypes "github.com/cosmos/ibc-go/v8/modules/core/03-connection/types"
+	chantypes "github.com/cosmos/ibc-go/v8/modules/core/04-channel/types"
+	ibcexported "github.com/cosmos/ibc-go/v8/modules/core/exported"
 	"github.com/cosmos/relayer/v2/relayer/provider"
 	"go.uber.org/zap/zapcore"
 )
+
+var _ zapcore.ObjectMarshaler = packetIBCMessage{}
+var _ zapcore.ObjectMarshaler = channelIBCMessage{}
+var _ zapcore.ObjectMarshaler = connectionIBCMessage{}
+var _ zapcore.ObjectMarshaler = clientICQMessage{}
 
 // pathEndMessages holds the different IBC messages that
 // will attempt to be sent to the pathEnd.
@@ -16,10 +25,22 @@ type pathEndMessages struct {
 	connectionMessages []connectionIBCMessage
 	channelMessages    []channelIBCMessage
 	packetMessages     []packetIBCMessage
+	clientICQMessages  []clientICQMessage
 }
 
 type ibcMessage interface {
-	ibcMessageIndicator()
+	// assemble executes the appropriate proof query function,
+	// then, if successful, assembles the message for the destination.
+	assemble(ctx context.Context, src, dst *pathEndRuntime) (provider.RelayerMessage, error)
+
+	// tracker creates a message tracker for message status
+	tracker(assembled provider.RelayerMessage) messageToTrack
+
+	// msgType returns a human readable string for logging describing the message type.
+	msgType() string
+
+	// satisfies zapcore.ObjectMarshaler interface for use with zap.Object().
+	MarshalLogObject(enc zapcore.ObjectEncoder) error
 }
 
 // packetIBCMessage holds a packet message's eventType and sequence along with it,
@@ -29,12 +50,85 @@ type packetIBCMessage struct {
 	eventType string
 }
 
-func (packetIBCMessage) ibcMessageIndicator() {}
+// assemble executes the appropriate proof query function,
+// then, if successful, assembles the packet message for the destination.
+func (msg packetIBCMessage) assemble(
+	ctx context.Context,
+	src, dst *pathEndRuntime,
+) (provider.RelayerMessage, error) {
+	var packetProof func(context.Context, provider.PacketInfo, uint64) (provider.PacketProof, error)
+	var assembleMessage func(provider.PacketInfo, provider.PacketProof) (provider.RelayerMessage, error)
+	switch msg.eventType {
+	case chantypes.EventTypeRecvPacket:
+		packetProof = src.chainProvider.PacketCommitment
+		assembleMessage = dst.chainProvider.MsgRecvPacket
+	case chantypes.EventTypeAcknowledgePacket:
+		packetProof = src.chainProvider.PacketAcknowledgement
+		assembleMessage = dst.chainProvider.MsgAcknowledgement
+	case chantypes.EventTypeTimeoutPacket:
+		if msg.info.ChannelOrder == chantypes.ORDERED.String() {
+			packetProof = src.chainProvider.NextSeqRecv
+		} else {
+			packetProof = src.chainProvider.PacketReceipt
+		}
+
+		assembleMessage = dst.chainProvider.MsgTimeout
+	default:
+		return nil, fmt.Errorf("unexepected packet message eventType for message assembly: %s", msg.eventType)
+	}
+	if src.clientState.ClientID == ibcexported.LocalhostClientID {
+		packetProof = src.localhostSentinelProofPacket
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, packetProofQueryTimeout)
+	defer cancel()
+
+	var proof provider.PacketProof
+	var err error
+	proof, err = packetProof(ctx, msg.info, src.latestBlock.Height)
+	if err != nil {
+		return nil, fmt.Errorf("error querying packet proof: %w", err)
+	}
+	return assembleMessage(msg.info, proof)
+}
+
+// tracker creates a message tracker for message status
+func (msg packetIBCMessage) tracker(assembled provider.RelayerMessage) messageToTrack {
+	return packetMessageToTrack{
+		msg:       msg,
+		assembled: assembled,
+	}
+}
+
+func (packetIBCMessage) msgType() string {
+	return "packet"
+}
+
+// MarshalLogObject satisfies the zapcore.ObjectMarshaler interface
+// so that you can use zap.Object("messages", r) when logging.
+// This is typically useful when logging details about a partially sent result.
+func (msg packetIBCMessage) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddString("type", msg.eventType)
+	enc.AddString("src_port", msg.info.SourcePort)
+	enc.AddString("src_channel", msg.info.SourceChannel)
+	enc.AddString("dst_port", msg.info.DestPort)
+	enc.AddString("dst_channel", msg.info.DestChannel)
+	enc.AddUint64("sequence", msg.info.Sequence)
+	enc.AddString("timeout_height", fmt.Sprintf(
+		"%d-%d",
+		msg.info.TimeoutHeight.RevisionNumber,
+		msg.info.TimeoutHeight.RevisionHeight,
+	))
+	enc.AddUint64("timeout_timestamp", msg.info.TimeoutTimestamp)
+	enc.AddString("data", base64.StdEncoding.EncodeToString(msg.info.Data))
+	enc.AddString("ack", base64.StdEncoding.EncodeToString(msg.info.Ack))
+	return nil
+}
 
 // channelKey returns channel key for new message by this eventType
 // based on prior eventType.
-func (p packetIBCMessage) channelKey() (ChannelKey, error) {
-	return PacketInfoChannelKey(p.eventType, p.info)
+func (msg packetIBCMessage) channelKey() (ChannelKey, error) {
+	return PacketInfoChannelKey(msg.eventType, msg.info)
 }
 
 // channelIBCMessage holds a channel handshake message's eventType along with its details,
@@ -44,7 +138,78 @@ type channelIBCMessage struct {
 	info      provider.ChannelInfo
 }
 
-func (channelIBCMessage) ibcMessageIndicator() {}
+// assemble executes the appropriate proof query function,
+// then, if successful, assembles the message for the destination.
+func (msg channelIBCMessage) assemble(
+	ctx context.Context,
+	src, dst *pathEndRuntime,
+) (provider.RelayerMessage, error) {
+	var chanProof func(context.Context, provider.ChannelInfo, uint64) (provider.ChannelProof, error)
+	var assembleMessage func(provider.ChannelInfo, provider.ChannelProof) (provider.RelayerMessage, error)
+	switch msg.eventType {
+	case chantypes.EventTypeChannelOpenInit:
+		// don't need proof for this message
+		assembleMessage = dst.chainProvider.MsgChannelOpenInit
+	case chantypes.EventTypeChannelOpenTry:
+		chanProof = src.chainProvider.ChannelProof
+		assembleMessage = dst.chainProvider.MsgChannelOpenTry
+	case chantypes.EventTypeChannelOpenAck:
+		chanProof = src.chainProvider.ChannelProof
+		assembleMessage = dst.chainProvider.MsgChannelOpenAck
+	case chantypes.EventTypeChannelOpenConfirm:
+		chanProof = src.chainProvider.ChannelProof
+		assembleMessage = dst.chainProvider.MsgChannelOpenConfirm
+	case chantypes.EventTypeChannelCloseInit:
+		// don't need proof for this message
+		assembleMessage = dst.chainProvider.MsgChannelCloseInit
+	case chantypes.EventTypeChannelCloseConfirm:
+		chanProof = src.chainProvider.ChannelProof
+		assembleMessage = dst.chainProvider.MsgChannelCloseConfirm
+	default:
+		return nil, fmt.Errorf("unexepected channel message eventType for message assembly: %s", msg.eventType)
+	}
+	if src.clientState.ClientID == ibcexported.LocalhostClientID {
+		chanProof = src.localhostSentinelProofChannel
+	}
+
+	var proof provider.ChannelProof
+	var err error
+	if chanProof != nil {
+		proof, err = chanProof(ctx, msg.info, src.latestBlock.Height)
+		if err != nil {
+			return nil, fmt.Errorf("error querying channel proof: %w", err)
+		}
+	}
+	return assembleMessage(msg.info, proof)
+}
+
+// tracker creates a message tracker for message status
+func (msg channelIBCMessage) tracker(assembled provider.RelayerMessage) messageToTrack {
+	return channelMessageToTrack{
+		msg:       msg,
+		assembled: assembled,
+	}
+}
+
+func (channelIBCMessage) msgType() string {
+	return "channel handshake"
+}
+
+// MarshalLogObject satisfies the zapcore.ObjectMarshaler interface
+// so that you can use zap.Object("messages", r) when logging.
+// This is typically useful when logging details about a partially sent result.
+func (msg channelIBCMessage) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddString("type", msg.eventType)
+	enc.AddString("port_id", msg.info.PortID)
+	enc.AddString("channel_id", msg.info.ChannelID)
+	enc.AddString("counterparty_port_id", msg.info.CounterpartyPortID)
+	enc.AddString("counterparty_channel_id", msg.info.CounterpartyChannelID)
+	enc.AddString("connection_id", msg.info.ConnID)
+	enc.AddString("counterparty_connection_id", msg.info.CounterpartyConnID)
+	enc.AddString("order", msg.info.Order.String())
+	enc.AddString("version", msg.info.Version)
+	return nil
+}
 
 // connectionIBCMessage holds a connection handshake message's eventType along with its details,
 // useful for sending messages around internal to the PathProcessor.
@@ -53,72 +218,334 @@ type connectionIBCMessage struct {
 	info      provider.ConnectionInfo
 }
 
-func (connectionIBCMessage) ibcMessageIndicator() {}
+// assemble executes the appropriate proof query function,
+// then, if successful, assembles the message for the destination.
+func (msg connectionIBCMessage) assemble(
+	ctx context.Context,
+	src, dst *pathEndRuntime,
+) (provider.RelayerMessage, error) {
+	var connProof func(context.Context, provider.ConnectionInfo, uint64) (provider.ConnectionProof, error)
+	var assembleMessage func(provider.ConnectionInfo, provider.ConnectionProof) (provider.RelayerMessage, error)
+	switch msg.eventType {
+	case conntypes.EventTypeConnectionOpenInit:
+		// don't need proof for this message
+		msg.info.CounterpartyCommitmentPrefix = src.chainProvider.CommitmentPrefix()
+		assembleMessage = dst.chainProvider.MsgConnectionOpenInit
+	case conntypes.EventTypeConnectionOpenTry:
+		msg.info.CounterpartyCommitmentPrefix = src.chainProvider.CommitmentPrefix()
+		connProof = src.chainProvider.ConnectionHandshakeProof
+		assembleMessage = dst.chainProvider.MsgConnectionOpenTry
+	case conntypes.EventTypeConnectionOpenAck:
+		connProof = src.chainProvider.ConnectionHandshakeProof
+		assembleMessage = dst.chainProvider.MsgConnectionOpenAck
+	case conntypes.EventTypeConnectionOpenConfirm:
+		connProof = src.chainProvider.ConnectionProof
+		assembleMessage = dst.chainProvider.MsgConnectionOpenConfirm
+	default:
+		return nil, fmt.Errorf("unexepected connection message eventType for message assembly: %s", msg.eventType)
+	}
+
+	var proof provider.ConnectionProof
+	var err error
+	if connProof != nil {
+		proof, err = connProof(ctx, msg.info, src.latestBlock.Height)
+		if err != nil {
+			return nil, fmt.Errorf("error querying connection proof: %w", err)
+		}
+	}
+
+	return assembleMessage(msg.info, proof)
+}
+
+// tracker creates a message tracker for message status
+func (msg connectionIBCMessage) tracker(assembled provider.RelayerMessage) messageToTrack {
+	return connectionMessageToTrack{
+		msg:       msg,
+		assembled: assembled,
+	}
+}
+
+func (connectionIBCMessage) msgType() string {
+	return "connection handshake"
+}
+
+// MarshalLogObject satisfies the zapcore.ObjectMarshaler interface
+// so that you can use zap.Object("messages", r) when logging.
+// This is typically useful when logging details about a partially sent result.
+func (msg connectionIBCMessage) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddString("type", msg.eventType)
+	enc.AddString("client_id", msg.info.ClientID)
+	enc.AddString("cntrprty_client_id", msg.info.CounterpartyClientID)
+	enc.AddString("conn_id", msg.info.ConnID)
+	enc.AddString("cntrprty_conn_id", msg.info.CounterpartyConnID)
+	enc.AddString("cntrprty_commitment_prefix", msg.info.CounterpartyCommitmentPrefix.String())
+	return nil
+}
+
+const (
+	ClientICQTypeRequest  ClientICQType = "query_request"
+	ClientICQTypeResponse ClientICQType = "query_response"
+)
+
+// clientICQMessage holds a client ICQ message info,
+// useful for sending messages around internal to the PathProcessor.
+type clientICQMessage struct {
+	info provider.ClientICQInfo
+}
+
+// assemble executes the query against the source chain,
+// then, if successful, assembles the response message for the destination.
+func (msg clientICQMessage) assemble(
+	ctx context.Context,
+	src, dst *pathEndRuntime,
+) (provider.RelayerMessage, error) {
+	ctx, cancel := context.WithTimeout(ctx, interchainQueryTimeout)
+	defer cancel()
+
+	proof, err := src.chainProvider.QueryICQWithProof(ctx, msg.info.Type, msg.info.Request, src.latestBlock.Height-1)
+	if err != nil {
+		return nil, fmt.Errorf("error during interchain query: %w", err)
+	}
+
+	return dst.chainProvider.MsgSubmitQueryResponse(msg.info.Chain, msg.info.QueryID, proof)
+}
+
+// tracker creates a message tracker for message status
+func (msg clientICQMessage) tracker(assembled provider.RelayerMessage) messageToTrack {
+	return clientICQMessageToTrack{
+		msg:       msg,
+		assembled: assembled,
+	}
+}
+
+func (clientICQMessage) msgType() string {
+	return "client ICQ"
+}
+
+// MarshalLogObject satisfies the zapcore.ObjectMarshaler interface
+// so that you can use zap.Object("messages", r) when logging.
+// This is typically useful when logging details about a partially sent result.
+func (msg clientICQMessage) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	enc.AddString("type", msg.info.Type)
+	enc.AddString("query_id", string(msg.info.QueryID))
+	enc.AddString("request", string(msg.info.Request))
+	return nil
+}
 
 // processingMessage tracks the state of a IBC message currently being processed.
 type processingMessage struct {
-	assembled           bool
-	lastProcessedHeight uint64
 	retryCount          uint64
+	lastProcessedHeight uint64
+	assembled           bool
+
+	processing bool
+	mu         sync.Mutex
+}
+
+func (m *processingMessage) isProcessing() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.processing
+}
+
+func (m *processingMessage) setProcessing(assembled bool, retryCount uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.processing = true
+	m.retryCount = retryCount
+	m.assembled = assembled
+}
+
+func (m *processingMessage) setFinishedProcessing(height uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastProcessedHeight = height
+	m.processing = false
 }
 
 type packetProcessingCache map[ChannelKey]packetChannelMessageCache
-type packetChannelMessageCache map[string]packetMessageSendCache
-type packetMessageSendCache map[uint64]processingMessage
+type packetChannelMessageCache map[string]*packetMessageSendCache
+
+type packetMessageSendCache struct {
+	mu sync.Mutex
+	m  map[uint64]*processingMessage
+}
+
+func newPacketMessageSendCache() *packetMessageSendCache {
+	return &packetMessageSendCache{
+		m: make(map[uint64]*processingMessage),
+	}
+}
+
+func (c *packetMessageSendCache) get(sequence uint64) *processingMessage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m[sequence]
+}
+
+func (c *packetMessageSendCache) set(sequence uint64, height uint64, assembled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[sequence] = &processingMessage{
+		processing:          true,
+		lastProcessedHeight: height,
+		assembled:           assembled,
+	}
+}
 
 func (c packetChannelMessageCache) deleteMessages(toDelete ...map[string][]uint64) {
 	for _, toDeleteMap := range toDelete {
 		for message, toDeleteMessages := range toDeleteMap {
-			for _, sequence := range toDeleteMessages {
-				delete(c[message], sequence)
+			if _, ok := c[message]; !ok {
+				continue
 			}
+			c[message].mu.Lock()
+			for _, sequence := range toDeleteMessages {
+				delete(c[message].m, sequence)
+			}
+			c[message].mu.Unlock()
 		}
 	}
 }
 
-type channelProcessingCache map[string]channelKeySendCache
-type channelKeySendCache map[ChannelKey]processingMessage
+type channelProcessingCache map[string]*channelKeySendCache
+type channelKeySendCache struct {
+	mu sync.Mutex
+	m  map[ChannelKey]*processingMessage
+}
+
+func newChannelKeySendCache() *channelKeySendCache {
+	return &channelKeySendCache{
+		m: make(map[ChannelKey]*processingMessage),
+	}
+}
+
+func (c *channelKeySendCache) get(key ChannelKey) *processingMessage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m[key]
+}
+
+func (c *channelKeySendCache) set(key ChannelKey, height uint64, assembled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[key] = &processingMessage{
+		processing:          true,
+		lastProcessedHeight: height,
+		assembled:           assembled,
+	}
+}
 
 func (c channelProcessingCache) deleteMessages(toDelete ...map[string][]ChannelKey) {
 	for _, toDeleteMap := range toDelete {
 		for message, toDeleteMessages := range toDeleteMap {
-			for _, channel := range toDeleteMessages {
-				delete(c[message], channel)
+			if _, ok := c[message]; !ok {
+				continue
 			}
+			c[message].mu.Lock()
+			for _, channel := range toDeleteMessages {
+				delete(c[message].m, channel)
+			}
+			c[message].mu.Unlock()
 		}
 	}
 }
 
-type connectionProcessingCache map[string]connectionKeySendCache
-type connectionKeySendCache map[ConnectionKey]processingMessage
+type connectionProcessingCache map[string]*connectionKeySendCache
+type connectionKeySendCache struct {
+	mu sync.Mutex
+	m  map[ConnectionKey]*processingMessage
+}
+
+func newConnectionKeySendCache() *connectionKeySendCache {
+	return &connectionKeySendCache{
+		m: make(map[ConnectionKey]*processingMessage),
+	}
+}
+
+func (c *connectionKeySendCache) get(key ConnectionKey) *processingMessage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m[key]
+}
+
+func (c *connectionKeySendCache) set(key ConnectionKey, height uint64, assembled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[key] = &processingMessage{
+		processing:          true,
+		lastProcessedHeight: height,
+		assembled:           assembled,
+	}
+}
 
 func (c connectionProcessingCache) deleteMessages(toDelete ...map[string][]ConnectionKey) {
 	for _, toDeleteMap := range toDelete {
 		for message, toDeleteMessages := range toDeleteMap {
-			for _, connection := range toDeleteMessages {
-				delete(c[message], connection)
+			if _, ok := c[message]; !ok {
+				continue
 			}
+			c[message].mu.Lock()
+			for _, connection := range toDeleteMessages {
+				delete(c[message].m, connection)
+			}
+			c[message].mu.Unlock()
 		}
+	}
+}
+
+type clientICQProcessingCache struct {
+	mu sync.Mutex
+	m  map[provider.ClientICQQueryID]*processingMessage
+}
+
+func newClientICQProcessingCache() *clientICQProcessingCache {
+	return &clientICQProcessingCache{
+		m: make(map[provider.ClientICQQueryID]*processingMessage),
+	}
+}
+
+func (c *clientICQProcessingCache) get(queryID provider.ClientICQQueryID) *processingMessage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m[queryID]
+}
+
+func (c *clientICQProcessingCache) set(queryID provider.ClientICQQueryID, height uint64, assembled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[queryID] = &processingMessage{
+		processing:          true,
+		lastProcessedHeight: height,
+		assembled:           assembled,
+	}
+}
+
+func (c *clientICQProcessingCache) deleteMessages(toDelete ...provider.ClientICQQueryID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, queryID := range toDelete {
+		delete(c.m, queryID)
 	}
 }
 
 // contains MsgRecvPacket from counterparty
 // entire packet flow
 type pathEndPacketFlowMessages struct {
-	Src                       *pathEndRuntime
-	Dst                       *pathEndRuntime
-	ChannelKey                ChannelKey
-	SrcMsgTransfer            PacketSequenceCache
-	DstMsgRecvPacket          PacketSequenceCache
-	SrcMsgAcknowledgement     PacketSequenceCache
-	SrcMsgTimeout             PacketSequenceCache
-	SrcMsgTimeoutOnClose      PacketSequenceCache
-	DstMsgChannelCloseConfirm *provider.ChannelInfo
+	Src                   *pathEndRuntime
+	Dst                   *pathEndRuntime
+	ChannelKey            ChannelKey
+	SrcPreTransfer        PacketSequenceCache
+	SrcMsgTransfer        PacketSequenceCache
+	DstMsgRecvPacket      PacketSequenceCache
+	SrcMsgAcknowledgement PacketSequenceCache
+	SrcMsgTimeout         PacketSequenceCache
 }
 
 type pathEndConnectionHandshakeMessages struct {
 	Src                         *pathEndRuntime
 	Dst                         *pathEndRuntime
+	SrcMsgConnectionPreInit     ConnectionMessageCache
 	SrcMsgConnectionOpenInit    ConnectionMessageCache
 	DstMsgConnectionOpenTry     ConnectionMessageCache
 	SrcMsgConnectionOpenAck     ConnectionMessageCache
@@ -128,10 +555,19 @@ type pathEndConnectionHandshakeMessages struct {
 type pathEndChannelHandshakeMessages struct {
 	Src                      *pathEndRuntime
 	Dst                      *pathEndRuntime
+	SrcMsgChannelPreInit     ChannelMessageCache
 	SrcMsgChannelOpenInit    ChannelMessageCache
 	DstMsgChannelOpenTry     ChannelMessageCache
 	SrcMsgChannelOpenAck     ChannelMessageCache
 	DstMsgChannelOpenConfirm ChannelMessageCache
+}
+
+type pathEndChannelCloseMessages struct {
+	Src                       *pathEndRuntime
+	Dst                       *pathEndRuntime
+	SrcMsgChannelPreInit      ChannelMessageCache
+	SrcMsgChannelCloseInit    ChannelMessageCache
+	DstMsgChannelCloseConfirm ChannelMessageCache
 }
 
 type pathEndPacketFlowResponse struct {
@@ -139,26 +575,16 @@ type pathEndPacketFlowResponse struct {
 	DstMessages []packetIBCMessage
 
 	DstChannelMessage []channelIBCMessage
-
-	ToDeleteSrc        map[string][]uint64
-	ToDeleteDst        map[string][]uint64
-	ToDeleteDstChannel map[string][]ChannelKey
 }
 
 type pathEndChannelHandshakeResponse struct {
 	SrcMessages []channelIBCMessage
 	DstMessages []channelIBCMessage
-
-	ToDeleteSrc map[string][]ChannelKey
-	ToDeleteDst map[string][]ChannelKey
 }
 
 type pathEndConnectionHandshakeResponse struct {
 	SrcMessages []connectionIBCMessage
 	DstMessages []connectionIBCMessage
-
-	ToDeleteSrc map[string][]ConnectionKey
-	ToDeleteDst map[string][]ConnectionKey
 }
 
 func packetInfoChannelKey(p provider.PacketInfo) ChannelKey {
@@ -170,88 +596,83 @@ func packetInfoChannelKey(p provider.PacketInfo) ChannelKey {
 	}
 }
 
-func connectionInfoConnectionKey(c provider.ConnectionInfo) ConnectionKey {
-	return ConnectionKey{
-		ClientID:             c.ClientID,
-		ConnectionID:         c.ConnID,
-		CounterpartyClientID: c.CounterpartyClientID,
-		CounterpartyConnID:   c.CounterpartyConnID,
-	}
-}
+type messageToTrack interface {
+	// assembledMsg returns the assembled message ready to send.
+	assembledMsg() provider.RelayerMessage
 
-func channelInfoChannelKey(c provider.ChannelInfo) ChannelKey {
-	return ChannelKey{
-		ChannelID:             c.ChannelID,
-		PortID:                c.PortID,
-		CounterpartyChannelID: c.CounterpartyChannelID,
-		CounterpartyPortID:    c.CounterpartyPortID,
-	}
-}
+	// msgType returns a human readable string for logging describing the message type.
+	msgType() string
 
-// outgoingMessages is a slice of relayer messages that can be
-// appended to concurrently.
-type outgoingMessages struct {
-	mu       sync.Mutex
-	msgs     []provider.RelayerMessage
-	pktMsgs  []packetMessageToTrack
-	connMsgs []connectionMessageToTrack
-	chanMsgs []channelMessageToTrack
-}
-
-// MarshalLogObject satisfies the zapcore.ObjectMarshaler interface
-// so that you can use zap.Object("messages", r) when logging.
-// This is typically useful when logging details about a partially sent result.
-func (om *outgoingMessages) MarshalLogObject(enc zapcore.ObjectEncoder) error {
-	for i, m := range om.pktMsgs {
-		pfx := "pkt_" + strconv.FormatInt(int64(i), 10) + "_"
-		enc.AddString(pfx+"event_type", m.msg.eventType)
-		enc.AddString(pfx+"src_chan", m.msg.info.SourceChannel)
-		enc.AddString(pfx+"src_port", m.msg.info.SourcePort)
-		enc.AddString(pfx+"dst_chan", m.msg.info.DestChannel)
-		enc.AddString(pfx+"dst_port", m.msg.info.DestPort)
-		enc.AddString(pfx+"data", string(m.msg.info.Data))
-	}
-	for i, m := range om.connMsgs {
-		pfx := "conn_" + strconv.FormatInt(int64(i), 10) + "_"
-		enc.AddString(pfx+"event_type", m.msg.eventType)
-		enc.AddString(pfx+"client_id", m.msg.info.ClientID)
-		enc.AddString(pfx+"conn_id", m.msg.info.ConnID)
-		enc.AddString(pfx+"cntrprty_client_id", m.msg.info.CounterpartyClientID)
-		enc.AddString(pfx+"cntrprty_conn_id", m.msg.info.CounterpartyConnID)
-	}
-	for i, m := range om.chanMsgs {
-		pfx := "chan_" + strconv.FormatInt(int64(i), 10) + "_"
-		enc.AddString(pfx+"event_type", m.msg.eventType)
-		enc.AddString(pfx+"chan_id", m.msg.info.ChannelID)
-		enc.AddString(pfx+"port_id", m.msg.info.PortID)
-		enc.AddString(pfx+"cntrprty_chan_id", m.msg.info.CounterpartyChannelID)
-		enc.AddString(pfx+"cntrprty_port_id", m.msg.info.CounterpartyPortID)
-	}
-	return nil
-}
-
-// Append acquires a lock on om's mutex and then appends msg.
-// When there are no more possible concurrent calls to Append,
-// it is safe to directly access om.msgs.
-func (om *outgoingMessages) Append(msg provider.RelayerMessage) {
-	om.mu.Lock()
-	defer om.mu.Unlock()
-	om.msgs = append(om.msgs, msg)
+	// satisfies zapcore.ObjectMarshaler interface for use with zap.Object().
+	MarshalLogObject(enc zapcore.ObjectEncoder) error
 }
 
 type packetMessageToTrack struct {
 	msg       packetIBCMessage
-	assembled bool
+	assembled provider.RelayerMessage
+}
+
+func (t packetMessageToTrack) assembledMsg() provider.RelayerMessage {
+	return t.assembled
+}
+
+func (t packetMessageToTrack) msgType() string {
+	return t.msg.msgType()
+}
+
+func (t packetMessageToTrack) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	return t.msg.MarshalLogObject(enc)
 }
 
 type connectionMessageToTrack struct {
 	msg       connectionIBCMessage
-	assembled bool
+	assembled provider.RelayerMessage
+}
+
+func (t connectionMessageToTrack) assembledMsg() provider.RelayerMessage {
+	return t.assembled
+}
+
+func (t connectionMessageToTrack) msgType() string {
+	return t.msg.msgType()
+}
+
+func (t connectionMessageToTrack) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	return t.msg.MarshalLogObject(enc)
 }
 
 type channelMessageToTrack struct {
 	msg       channelIBCMessage
-	assembled bool
+	assembled provider.RelayerMessage
+}
+
+func (t channelMessageToTrack) assembledMsg() provider.RelayerMessage {
+	return t.assembled
+}
+
+func (t channelMessageToTrack) msgType() string {
+	return t.msg.msgType()
+}
+
+func (t channelMessageToTrack) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	return t.msg.MarshalLogObject(enc)
+}
+
+type clientICQMessageToTrack struct {
+	msg       clientICQMessage
+	assembled provider.RelayerMessage
+}
+
+func (t clientICQMessageToTrack) assembledMsg() provider.RelayerMessage {
+	return t.assembled
+}
+
+func (t clientICQMessageToTrack) msgType() string {
+	return t.msg.msgType()
+}
+
+func (t clientICQMessageToTrack) MarshalLogObject(enc zapcore.ObjectEncoder) error {
+	return t.msg.MarshalLogObject(enc)
 }
 
 // orderFromString parses a string into a channel order byte.

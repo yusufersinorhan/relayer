@@ -3,18 +3,19 @@ package relayer
 import (
 	"context"
 	"fmt"
+	"strings"
 
-	clienttypes "github.com/cosmos/ibc-go/v5/modules/core/02-client/types"
-	conntypes "github.com/cosmos/ibc-go/v5/modules/core/03-connection/types"
+	clienttypes "github.com/cosmos/ibc-go/v8/modules/core/02-client/types"
+	conntypes "github.com/cosmos/ibc-go/v8/modules/core/03-connection/types"
+	"github.com/cosmos/relayer/v2/relayer/processor"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	check     = "✔"
-	xIcon     = "✘"
-	allowList = "allowlist"
-	denyList  = "denylist"
+	check   = "✔"
+	xIcon   = "✘"
+	Expired = "EXPIRED"
 )
 
 // Paths represent connection paths between chains
@@ -95,6 +96,12 @@ type Path struct {
 	Filter ChannelFilter `yaml:"src-channel-filter" json:"src-channel-filter"`
 }
 
+// Named path wraps a Path with its name.
+type NamedPath struct {
+	Name string
+	Path *Path
+}
+
 // ChannelFilter provides the means for either creating an allowlist or a denylist of channels on the src chain
 // which will be used to narrow down the list of channels a user wants to relay on.
 type ChannelFilter struct {
@@ -105,24 +112,24 @@ type ChannelFilter struct {
 type IBCdata struct {
 	Schema string `json:"$schema"`
 	Chain1 struct {
-		ChainName    string `json:"chain-name"`
-		ClientID     string `json:"client-id"`
-		ConnectionID string `json:"connection-id"`
-	} `json:"chain-1"`
+		ChainName    string `json:"chain_name"`
+		ClientID     string `json:"client_id"`
+		ConnectionID string `json:"connection_id"`
+	} `json:"chain_1"`
 	Chain2 struct {
-		ChainName    string `json:"chain-name"`
-		ClientID     string `json:"client-id"`
-		ConnectionID string `json:"connection-id"`
-	} `json:"chain-2"`
+		ChainName    string `json:"chain_name"`
+		ClientID     string `json:"client_id"`
+		ConnectionID string `json:"connection_id"`
+	} `json:"chain_2"`
 	Channels []struct {
 		Chain1 struct {
-			ChannelID string `json:"channel-id"`
-			PortID    string `json:"port-id"`
-		} `json:"chain-1"`
+			ChannelID string `json:"channel_id"`
+			PortID    string `json:"port_id"`
+		} `json:"chain_1"`
 		Chain2 struct {
-			ChannelID string `json:"channel-id"`
-			PortID    string `json:"port-id"`
-		} `json:"chain-2"`
+			ChannelID string `json:"channel_id"`
+			PortID    string `json:"port_id"`
+		} `json:"chain_2"`
 		Ordering string `json:"ordering"`
 		Version  string `json:"version"`
 		Tags     struct {
@@ -136,9 +143,9 @@ type IBCdata struct {
 
 // ValidateChannelFilterRule verifies that the configured ChannelFilter rule is set to an appropriate value.
 func (p *Path) ValidateChannelFilterRule() error {
-	if p.Filter.Rule != allowList && p.Filter.Rule != denyList && p.Filter.Rule != "" {
+	if p.Filter.Rule != processor.RuleAllowList && p.Filter.Rule != processor.RuleDenyList && p.Filter.Rule != "" {
 		return fmt.Errorf("%s is not a valid channel filter rule, please "+
-			"ensure your channel filter rule is `%s` or '%s'", p.Filter.Rule, allowList, denyList)
+			"ensure your channel filter rule is `%s` or '%s'", p.Filter.Rule, processor.RuleAllowList, processor.RuleDenyList)
 	}
 	return nil
 }
@@ -242,6 +249,23 @@ func (p *Path) QueryPathStatus(ctx context.Context, src, dst *Chain) *PathWithSt
 		return err
 	})
 	if err := eg.Wait(); err != nil || srcCs == nil || dstCs == nil {
+		return out
+	}
+
+	srcExpiration, srcClientInfo, errSrc := QueryClientExpiration(ctx, src, dst)
+	if errSrc != nil {
+		return out
+	}
+
+	dstExpiration, dstClientInfo, errDst := QueryClientExpiration(ctx, dst, src)
+	if errDst != nil {
+		return out
+	}
+
+	srcData := SPrintClientExpiration(src, srcExpiration, srcClientInfo)
+	dstData := SPrintClientExpiration(dst, dstExpiration, dstClientInfo)
+
+	if strings.Contains(srcData, Expired) || strings.Contains(dstData, Expired) {
 		return out
 	}
 	out.Status.Clients = true

@@ -17,10 +17,14 @@ import (
 // after a given relay round. MaxTxSize and MaxMsgLength are ignored if they are
 // set to zero.
 type RelayMsgs struct {
-	Src          []provider.RelayerMessage `json:"src"`
-	Dst          []provider.RelayerMessage `json:"dst"`
-	MaxTxSize    uint64                    `json:"max_tx_size"`    // maximum permitted size of the msgs in a bundled relay transaction
-	MaxMsgLength uint64                    `json:"max_msg_length"` // maximum amount of messages in a bundled relay transaction
+	Src []provider.RelayerMessage `json:"src"`
+	Dst []provider.RelayerMessage `json:"dst"`
+
+	// maximum permitted size of the msgs in a bundled relay transaction
+	MaxTxSize uint64 `json:"max_tx_size"`
+
+	// maximum amount of messages in a bundled relay transaction
+	MaxMsgLength uint64 `json:"max_msg_length"`
 }
 
 // batchSendMessageTimeout is the timeout for sending a single batch of IBC messages to an RPC node.
@@ -108,6 +112,11 @@ type SendMsgsResult struct {
 	SrcSendError, DstSendError error
 }
 
+// SuccessfullySent reports the presence successfully sent batches
+func (r SendMsgsResult) SuccessfullySent() bool {
+	return r.SuccessfulSrcBatches > 0 || r.SuccessfulDstBatches > 0
+}
+
 // PartiallySent reports the presence of both some successfully sent batches
 // and some errors.
 func (r SendMsgsResult) PartiallySent() bool {
@@ -141,7 +150,12 @@ func (r SendMsgsResult) MarshalLogObject(enc zapcore.ObjectEncoder) error {
 }
 
 // Send concurrently sends out r's messages to the corresponding RelayMsgSenders.
-func (r *RelayMsgs) Send(ctx context.Context, log *zap.Logger, src, dst RelayMsgSender, memo string) SendMsgsResult {
+func (r *RelayMsgs) Send(
+	ctx context.Context,
+	log *zap.Logger,
+	src, dst RelayMsgSender,
+	memo string,
+) SendMsgsResult {
 	var (
 		wg     sync.WaitGroup
 		result SendMsgsResult
@@ -151,6 +165,7 @@ func (r *RelayMsgs) Send(ctx context.Context, log *zap.Logger, src, dst RelayMsg
 		wg.Add(1)
 		go r.send(ctx, log, &wg, src, r.Src, memo, &result.SuccessfulSrcBatches, &result.SrcSendError)
 	}
+
 	if len(r.Dst) > 0 {
 		wg.Add(1)
 		go r.send(ctx, log, &wg, dst, r.Dst, memo, &result.SuccessfulDstBatches, &result.DstSendError)

@@ -6,35 +6,45 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	sdkerrors "cosmossdk.io/errors"
+	"cosmossdk.io/x/feegrant"
+	upgradetypes "cosmossdk.io/x/upgrade/types"
+	abci "github.com/cometbft/cometbft/abci/types"
+	coretypes "github.com/cometbft/cometbft/rpc/core/types"
+	tmtypes "github.com/cometbft/cometbft/types"
 	"github.com/cosmos/cosmos-sdk/codec"
 	sdk "github.com/cosmos/cosmos-sdk/types"
-	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
+	grpctypes "github.com/cosmos/cosmos-sdk/types/grpc"
 	querytypes "github.com/cosmos/cosmos-sdk/types/query"
 	bankTypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+	"github.com/cosmos/cosmos-sdk/x/params/types/proposal"
 	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
-	upgradetypes "github.com/cosmos/cosmos-sdk/x/upgrade/types"
-	transfertypes "github.com/cosmos/ibc-go/v5/modules/apps/transfer/types"
-	clienttypes "github.com/cosmos/ibc-go/v5/modules/core/02-client/types"
-	conntypes "github.com/cosmos/ibc-go/v5/modules/core/03-connection/types"
-	chantypes "github.com/cosmos/ibc-go/v5/modules/core/04-channel/types"
-	commitmenttypes "github.com/cosmos/ibc-go/v5/modules/core/23-commitment/types"
-	host "github.com/cosmos/ibc-go/v5/modules/core/24-host"
-	ibcexported "github.com/cosmos/ibc-go/v5/modules/core/exported"
-	tmclient "github.com/cosmos/ibc-go/v5/modules/light-clients/07-tendermint/types"
+	transfertypes "github.com/cosmos/ibc-go/v8/modules/apps/transfer/types"
+	clienttypes "github.com/cosmos/ibc-go/v8/modules/core/02-client/types"
+	conntypes "github.com/cosmos/ibc-go/v8/modules/core/03-connection/types"
+	chantypes "github.com/cosmos/ibc-go/v8/modules/core/04-channel/types"
+	commitmenttypes "github.com/cosmos/ibc-go/v8/modules/core/23-commitment/types"
+	host "github.com/cosmos/ibc-go/v8/modules/core/24-host"
+	ibcexported "github.com/cosmos/ibc-go/v8/modules/core/exported"
+	tmclient "github.com/cosmos/ibc-go/v8/modules/light-clients/07-tendermint"
+	"github.com/cosmos/relayer/v2/relayer/chains"
 	"github.com/cosmos/relayer/v2/relayer/provider"
-	abci "github.com/tendermint/tendermint/abci/types"
-	tmtypes "github.com/tendermint/tendermint/types"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc/metadata"
 )
+
+const PaginationDelay = 10 * time.Millisecond
 
 var _ provider.QueryProvider = &CosmosProvider{}
 
 // queryIBCMessages returns an array of IBC messages given a tag
-func (cc *CosmosProvider) queryIBCMessages(ctx context.Context, log *zap.Logger, page, limit int, query string) ([]ibcMessage, error) {
+func (cc *CosmosProvider) queryIBCMessages(ctx context.Context, log *zap.Logger, page, limit int, query string) ([]chains.IbcMessage, error) {
 	if query == "" {
 		return nil, errors.New("query string must be provided")
 	}
@@ -47,18 +57,57 @@ func (cc *CosmosProvider) queryIBCMessages(ctx context.Context, log *zap.Logger,
 		return nil, errors.New("limit must greater than 0")
 	}
 
-	res, err := cc.RPCClient.TxSearch(ctx, query, true, &page, &limit, "")
-	if err != nil {
-		return nil, err
-	}
-	var ibcMsgs []ibcMessage
-	for _, tx := range res.Txs {
-		parsedLogs, err := sdk.ParseABCILogs(tx.TxResult.Log)
+	chainID := cc.ChainId()
+
+	var (
+		eg      errgroup.Group
+		ibcMsgs []chains.IbcMessage
+		mu      sync.Mutex
+	)
+
+	eg.Go(func() error {
+		res, err := cc.RPCClient.BlockSearch(ctx, query, &page, &limit, "")
 		if err != nil {
-			continue
+			return err
 		}
 
-		ibcMsgs = append(ibcMsgs, parseABCILogs(log, parsedLogs, 0)...)
+		var nestedEg errgroup.Group
+
+		for _, b := range res.Blocks {
+			b := b
+			nestedEg.Go(func() error {
+				block, err := cc.RPCClient.BlockResults(ctx, &b.Block.Height)
+				if err != nil {
+					return err
+				}
+
+				mu.Lock()
+				defer mu.Unlock()
+				ibcMsgs = append(ibcMsgs, chains.IbcMessagesFromEvents(log, block.FinalizeBlockEvents, chainID, 0)...)
+
+				return nil
+			})
+		}
+		return nestedEg.Wait()
+	})
+
+	eg.Go(func() error {
+		res, err := cc.RPCClient.TxSearch(ctx, query, true, &page, &limit, "")
+		if err != nil {
+			return err
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		for _, tx := range res.Txs {
+			ibcMsgs = append(ibcMsgs, chains.IbcMessagesFromEvents(log, tx.TxResult.Events, chainID, 0)...)
+		}
+
+		return nil
+	})
+
+	if err := eg.Wait(); err != nil {
+		return nil, err
 	}
 
 	return ibcMsgs, nil
@@ -76,7 +125,7 @@ func (cc *CosmosProvider) QueryTx(ctx context.Context, hashHex string) (*provide
 		return nil, err
 	}
 
-	events := parseEventsFromResponseDeliverTx(resp.TxResult)
+	events := parseEventsFromResponseDeliverTx(resp.TxResult.Events)
 
 	return &provider.RelayerTxResponse{
 		Height: resp.Height,
@@ -110,7 +159,7 @@ func (cc *CosmosProvider) QueryTxs(ctx context.Context, page, limit int, events 
 	// at most, one tx in the response. Because of this we don't want to initialize the slice with an initial size.
 	var txResps []*provider.RelayerTxResponse
 	for _, tx := range res.Txs {
-		relayerEvents := parseEventsFromResponseDeliverTx(tx.TxResult)
+		relayerEvents := parseEventsFromResponseDeliverTx(tx.TxResult.Events)
 		txResps = append(txResps, &provider.RelayerTxResponse{
 			Height: tx.Height,
 			TxHash: string(tx.Hash),
@@ -124,20 +173,109 @@ func (cc *CosmosProvider) QueryTxs(ctx context.Context, page, limit int, events 
 
 // parseEventsFromResponseDeliverTx parses the events from a ResponseDeliverTx and builds a slice
 // of provider.RelayerEvent's.
-func parseEventsFromResponseDeliverTx(resp abci.ResponseDeliverTx) []provider.RelayerEvent {
-	var events []provider.RelayerEvent
+func parseEventsFromResponseDeliverTx(events []abci.Event) []provider.RelayerEvent {
+	var rlyEvents []provider.RelayerEvent
 
-	for _, event := range resp.Events {
+	for _, event := range events {
 		attributes := make(map[string]string)
 		for _, attribute := range event.Attributes {
-			attributes[string(attribute.Key)] = string(attribute.Value)
+			attributes[attribute.Key] = attribute.Value
 		}
-		events = append(events, provider.RelayerEvent{
+
+		rlyEvents = append(rlyEvents, provider.RelayerEvent{
 			EventType:  event.Type,
 			Attributes: attributes,
 		})
 	}
-	return events
+
+	return rlyEvents
+}
+
+// QueryFeegrantsByGrantee returns all requested grants for the given grantee.
+// Default behavior will return all grants.
+func (cc *CosmosProvider) QueryFeegrantsByGrantee(address string, paginator *querytypes.PageRequest) ([]*feegrant.Grant, error) {
+	grants := []*feegrant.Grant{}
+	allPages := paginator == nil
+
+	req := &feegrant.QueryAllowancesRequest{Grantee: address, Pagination: paginator}
+	queryClient := feegrant.NewQueryClient(cc)
+	ctx, cancel := cc.GetQueryContext(0)
+	defer cancel()
+	hasNextPage := true
+
+	for {
+		res, err := queryClient.Allowances(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+
+		if res.Allowances != nil {
+			grants = append(grants, res.Allowances...)
+		}
+
+		if res.Pagination != nil {
+			req.Pagination.Key = res.Pagination.NextKey
+			if len(res.Pagination.NextKey) == 0 {
+				hasNextPage = false
+			}
+		} else {
+			hasNextPage = false
+		}
+
+		if !allPages || !hasNextPage {
+			break
+		}
+	}
+
+	return grants, nil
+}
+
+// Feegrant_GrantsByGranterRPC returns all requested grants for the given Granter.
+// Default behavior will return all grants.
+func (cc *CosmosProvider) QueryFeegrantsByGranter(address string, paginator *querytypes.PageRequest) ([]*feegrant.Grant, error) {
+	grants := []*feegrant.Grant{}
+	allPages := paginator == nil
+
+	req := &feegrant.QueryAllowancesByGranterRequest{Granter: address, Pagination: paginator}
+	queryClient := feegrant.NewQueryClient(cc)
+	ctx, cancel := cc.GetQueryContext(0)
+	defer cancel()
+	hasNextPage := true
+
+	for {
+		res, err := queryClient.AllowancesByGranter(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+
+		if res.Allowances != nil {
+			grants = append(grants, res.Allowances...)
+		}
+
+		if res.Pagination != nil && res.Pagination.NextKey != nil {
+			req.Pagination.Key = res.Pagination.NextKey
+			if len(res.Pagination.NextKey) == 0 {
+				hasNextPage = false
+			}
+		} else {
+			hasNextPage = false
+		}
+
+		if !allPages || !hasNextPage {
+			break
+		}
+	}
+
+	return grants, nil
+}
+
+// GetQueryContext returns a context that includes the height and uses the timeout from the config
+func (cc *CosmosProvider) GetQueryContext(height int64) (context.Context, context.CancelFunc) {
+	timeout, _ := time.ParseDuration(cc.PCfg.Timeout) // Timeout is validated in the config so no error check
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	strHeight := strconv.FormatInt(height, 10)
+	ctx = metadata.AppendToOutgoingContext(ctx, grpctypes.GRPCBlockHeightHeader, strHeight)
+	return ctx, cancel
 }
 
 // QueryBalance returns the amount of coins in the relayer account
@@ -151,30 +289,81 @@ func (cc *CosmosProvider) QueryBalance(ctx context.Context, keyName string) (sdk
 }
 
 // QueryBalanceWithAddress returns the amount of coins in the relayer account with address as input
-// TODO add pagination support
 func (cc *CosmosProvider) QueryBalanceWithAddress(ctx context.Context, address string) (sdk.Coins, error) {
-	p := &bankTypes.QueryAllBalancesRequest{Address: address, Pagination: DefaultPageRequest()}
-	queryClient := bankTypes.NewQueryClient(cc)
+	qc := bankTypes.NewQueryClient(cc)
+	p := DefaultPageRequest()
+	coins := sdk.Coins{}
 
-	res, err := queryClient.AllBalances(ctx, p)
+	for {
+		res, err := qc.AllBalances(ctx, &bankTypes.QueryAllBalancesRequest{
+			Address:    address,
+			Pagination: p,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		coins = append(coins, res.Balances...)
+		next := res.GetPagination().GetNextKey()
+		if len(next) == 0 {
+			break
+		}
+
+		time.Sleep(PaginationDelay)
+		p.Key = next
+	}
+	return coins, nil
+}
+
+func (cc *CosmosProvider) queryParamsSubspaceTime(ctx context.Context, subspace string, key string) (time.Duration, error) {
+	queryClient := proposal.NewQueryClient(cc)
+
+	params := proposal.QueryParamsRequest{Subspace: subspace, Key: key}
+
+	res, err := queryClient.Params(ctx, &params)
+
 	if err != nil {
-		return nil, err
+		return 0, fmt.Errorf("failed to make %s params request: %w", subspace, err)
 	}
 
-	return res.Balances, nil
+	if res.Param.Value == "" {
+		return 0, fmt.Errorf("%s %s is empty", subspace, key)
+	}
+
+	unbondingValue, err := strconv.ParseUint(strings.ReplaceAll(res.Param.Value, `"`, ""), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse %s from %s param: %w", key, subspace, err)
+	}
+
+	return time.Duration(unbondingValue), nil
 }
 
 // QueryUnbondingPeriod returns the unbonding period of the chain
 func (cc *CosmosProvider) QueryUnbondingPeriod(ctx context.Context) (time.Duration, error) {
-	req := stakingtypes.QueryParamsRequest{}
-	queryClient := stakingtypes.NewQueryClient(cc)
 
-	res, err := queryClient.Params(ctx, &req)
-	if err != nil {
-		return 0, err
+	// Attempt ICS query
+	consumerUnbondingPeriod, consumerErr := cc.queryParamsSubspaceTime(ctx, "ccvconsumer", "UnbondingPeriod")
+	if consumerErr == nil {
+		return consumerUnbondingPeriod, nil
 	}
 
-	return res.Params.UnbondingTime, nil
+	//Attempt Staking query.
+	unbondingPeriod, stakingParamsErr := cc.queryParamsSubspaceTime(ctx, "staking", "UnbondingTime")
+	if stakingParamsErr == nil {
+		return unbondingPeriod, nil
+	}
+
+	// Fallback
+	req := stakingtypes.QueryParamsRequest{}
+	queryClient := stakingtypes.NewQueryClient(cc)
+	res, err := queryClient.Params(ctx, &req)
+	if err == nil {
+		return res.Params.UnbondingTime, nil
+
+	}
+
+	return 0,
+		fmt.Errorf("failed to query unbonding period from ccvconsumer, staking & fallback : %w: %s : %s", consumerErr, stakingParamsErr.Error(), err.Error())
 }
 
 // QueryTendermintProof performs an ABCI query with the given key and returns
@@ -202,7 +391,7 @@ func (cc *CosmosProvider) QueryTendermintProof(ctx context.Context, height int64
 	}
 
 	req := abci.RequestQuery{
-		Path:   fmt.Sprintf("store/%s/key", host.StoreKey),
+		Path:   fmt.Sprintf("store/%s/key", ibcexported.StoreKey),
 		Height: height,
 		Data:   key,
 		Prove:  true,
@@ -218,7 +407,7 @@ func (cc *CosmosProvider) QueryTendermintProof(ctx context.Context, height int64
 		return nil, nil, clienttypes.Height{}, err
 	}
 
-	cdc := codec.NewProtoCodec(cc.Codec.InterfaceRegistry)
+	cdc := codec.NewProtoCodec(cc.Cdc.InterfaceRegistry)
 
 	proofBz, err := cdc.Marshal(&merkleProof)
 	if err != nil {
@@ -243,7 +432,7 @@ func (cc *CosmosProvider) QueryClientStateResponse(ctx context.Context, height i
 		return nil, sdkerrors.Wrap(clienttypes.ErrClientNotFound, srcClientId)
 	}
 
-	cdc := codec.NewProtoCodec(cc.Codec.InterfaceRegistry)
+	cdc := codec.NewProtoCodec(cc.Cdc.InterfaceRegistry)
 
 	clientState, err := clienttypes.UnmarshalClientState(cdc, value)
 	if err != nil {
@@ -292,7 +481,7 @@ func (cc *CosmosProvider) QueryClientConsensusState(ctx context.Context, chainHe
 		return nil, sdkerrors.Wrap(clienttypes.ErrConsensusStateNotFound, clientid)
 	}
 
-	cdc := codec.NewProtoCodec(cc.Codec.InterfaceRegistry)
+	cdc := codec.NewProtoCodec(cc.Cdc.InterfaceRegistry)
 
 	cs, err := clienttypes.UnmarshalConsensusState(cdc, value)
 	if err != nil {
@@ -329,7 +518,7 @@ func (cc *CosmosProvider) QueryUpgradeProof(ctx context.Context, key []byte, hei
 		return nil, clienttypes.Height{}, err
 	}
 
-	proof, err := cc.Codec.Marshaler.Marshal(&merkleProof)
+	proof, err := cc.Cdc.Marshaler.Marshal(&merkleProof)
 	if err != nil {
 		return nil, clienttypes.Height{}, err
 	}
@@ -426,16 +615,29 @@ func (cc *CosmosProvider) QueryConsensusState(ctx context.Context, height int64)
 }
 
 // QueryClients queries all the clients!
-// TODO add pagination support
 func (cc *CosmosProvider) QueryClients(ctx context.Context) (clienttypes.IdentifiedClientStates, error) {
 	qc := clienttypes.NewQueryClient(cc)
-	state, err := qc.ClientStates(ctx, &clienttypes.QueryClientStatesRequest{
-		Pagination: DefaultPageRequest(),
-	})
-	if err != nil {
-		return nil, err
+	p := DefaultPageRequest()
+	clients := clienttypes.IdentifiedClientStates{}
+
+	for {
+		res, err := qc.ClientStates(ctx, &clienttypes.QueryClientStatesRequest{
+			Pagination: p,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		clients = append(clients, res.ClientStates...)
+		next := res.GetPagination().GetNextKey()
+		if len(next) == 0 {
+			break
+		}
+
+		time.Sleep(PaginationDelay)
+		p.Key = next
 	}
-	return state.ClientStates, nil
+	return clients, nil
 }
 
 // QueryConnection returns the remote end of a given connection
@@ -476,7 +678,7 @@ func (cc *CosmosProvider) queryConnectionABCI(ctx context.Context, height int64,
 		return nil, sdkerrors.Wrap(conntypes.ErrConnectionNotFound, connectionID)
 	}
 
-	cdc := codec.NewProtoCodec(cc.Codec.InterfaceRegistry)
+	cdc := codec.NewProtoCodec(cc.Cdc.InterfaceRegistry)
 
 	var connection conntypes.ConnectionEnd
 	if err := cdc.Unmarshal(value, &connection); err != nil {
@@ -491,26 +693,60 @@ func (cc *CosmosProvider) queryConnectionABCI(ctx context.Context, height int64,
 }
 
 // QueryConnections gets any connections on a chain
-// TODO add pagination support
-func (cc *CosmosProvider) QueryConnections(ctx context.Context) (conns []*conntypes.IdentifiedConnection, err error) {
+func (cc *CosmosProvider) QueryConnections(ctx context.Context) ([]*conntypes.IdentifiedConnection, error) {
 	qc := conntypes.NewQueryClient(cc)
-	res, err := qc.Connections(ctx, &conntypes.QueryConnectionsRequest{
-		Pagination: DefaultPageRequest(),
-	})
-	if err != nil || res == nil {
-		return nil, err
+	p := DefaultPageRequest()
+	conns := []*conntypes.IdentifiedConnection{}
+
+	for {
+		res, err := qc.Connections(ctx, &conntypes.QueryConnectionsRequest{
+			Pagination: p,
+		})
+		if err != nil || res == nil {
+			return nil, err
+		}
+
+		conns = append(conns, res.Connections...)
+		next := res.GetPagination().GetNextKey()
+		if len(next) == 0 {
+			break
+		}
+
+		time.Sleep(PaginationDelay)
+		p.Key = next
 	}
-	return res.Connections, err
+	return conns, nil
 }
 
 // QueryConnectionsUsingClient gets any connections that exist between chain and counterparty
-// TODO add pagination support
 func (cc *CosmosProvider) QueryConnectionsUsingClient(ctx context.Context, height int64, clientid string) (*conntypes.QueryConnectionsResponse, error) {
 	qc := conntypes.NewQueryClient(cc)
-	res, err := qc.Connections(ctx, &conntypes.QueryConnectionsRequest{
-		Pagination: DefaultPageRequest(),
-	})
-	return res, err
+	p := DefaultPageRequest()
+	connections := &conntypes.QueryConnectionsResponse{}
+
+	for {
+		res, err := qc.Connections(ctx, &conntypes.QueryConnectionsRequest{
+			Pagination: p,
+		})
+		if err != nil || res == nil {
+			return nil, err
+		}
+
+		for _, conn := range res.Connections {
+			if conn.ClientId == clientid {
+				connections.Connections = append(connections.Connections, conn)
+			}
+		}
+
+		next := res.GetPagination().GetNextKey()
+		if len(next) == 0 {
+			break
+		}
+
+		time.Sleep(PaginationDelay)
+		p.Key = next
+	}
+	return connections, nil
 }
 
 // GenerateConnHandshakeProof generates all the proofs needed to prove the existence of the
@@ -556,7 +792,6 @@ func (cc *CosmosProvider) GenerateConnHandshakeProof(ctx context.Context, height
 func (cc *CosmosProvider) QueryChannel(ctx context.Context, height int64, channelid, portid string) (chanRes *chantypes.QueryChannelResponse, err error) {
 	res, err := cc.queryChannelABCI(ctx, height, portid, channelid)
 	if err != nil && strings.Contains(err.Error(), "not found") {
-
 		return &chantypes.QueryChannelResponse{
 			Channel: &chantypes.Channel{
 				State:    chantypes.UNINITIALIZED,
@@ -593,7 +828,7 @@ func (cc *CosmosProvider) queryChannelABCI(ctx context.Context, height int64, po
 		return nil, sdkerrors.Wrapf(chantypes.ErrChannelNotFound, "portID (%s), channelID (%s)", portID, channelID)
 	}
 
-	cdc := codec.NewProtoCodec(cc.Codec.InterfaceRegistry)
+	cdc := codec.NewProtoCodec(cc.Cdc.InterfaceRegistry)
 
 	var channel chantypes.Channel
 	if err := cdc.Unmarshal(value, &channel); err != nil {
@@ -623,57 +858,130 @@ func (cc *CosmosProvider) QueryChannelClient(ctx context.Context, height int64, 
 // QueryConnectionChannels queries the channels associated with a connection
 func (cc *CosmosProvider) QueryConnectionChannels(ctx context.Context, height int64, connectionid string) ([]*chantypes.IdentifiedChannel, error) {
 	qc := chantypes.NewQueryClient(cc)
-	chans, err := qc.ConnectionChannels(ctx, &chantypes.QueryConnectionChannelsRequest{
-		Connection: connectionid,
-		Pagination: DefaultPageRequest(),
-	})
-	if err != nil {
-		return nil, err
+	p := DefaultPageRequest()
+	channels := []*chantypes.IdentifiedChannel{}
+
+	for {
+		res, err := qc.ConnectionChannels(ctx, &chantypes.QueryConnectionChannelsRequest{
+			Connection: connectionid,
+			Pagination: p,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		channels = append(channels, res.Channels...)
+		next := res.GetPagination().GetNextKey()
+		if len(next) == 0 {
+			break
+		}
+
+		time.Sleep(PaginationDelay)
+		p.Key = next
 	}
-	return chans.Channels, nil
+	return channels, nil
 }
 
-// QueryChannels returns all the channels that are registered on a chain
-// TODO add pagination support
+// QueryChannels returns all the channels that are registered on a chain.
 func (cc *CosmosProvider) QueryChannels(ctx context.Context) ([]*chantypes.IdentifiedChannel, error) {
+	p := DefaultPageRequest()
+	chans := []*chantypes.IdentifiedChannel{}
+
+	for {
+		res, next, err := cc.QueryChannelsPaginated(ctx, p)
+		if err != nil {
+			return nil, err
+		}
+
+		chans = append(chans, res...)
+		if len(next) == 0 {
+			break
+		}
+
+		time.Sleep(PaginationDelay)
+		p.Key = next
+	}
+
+	return chans, nil
+}
+
+// QueryChannelsPaginated returns all the channels for a particular paginated request that are registered on a chain.
+func (cc *CosmosProvider) QueryChannelsPaginated(
+	ctx context.Context,
+	pageRequest *querytypes.PageRequest,
+) ([]*chantypes.IdentifiedChannel, []byte, error) {
 	qc := chantypes.NewQueryClient(cc)
+
+	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+	defer cancel()
+
 	res, err := qc.Channels(ctx, &chantypes.QueryChannelsRequest{
-		Pagination: DefaultPageRequest(),
+		Pagination: pageRequest,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return res.Channels, nil
+
+	next := res.GetPagination().GetNextKey()
+
+	return res.Channels, next, nil
 }
 
 // QueryPacketCommitments returns an array of packet commitments
-// TODO add pagination support
-func (cc *CosmosProvider) QueryPacketCommitments(ctx context.Context, height uint64, channelid, portid string) (commitments *chantypes.QueryPacketCommitmentsResponse, err error) {
+func (cc *CosmosProvider) QueryPacketCommitments(ctx context.Context, height uint64, channelid, portid string) (*chantypes.QueryPacketCommitmentsResponse, error) {
 	qc := chantypes.NewQueryClient(cc)
-	c, err := qc.PacketCommitments(ctx, &chantypes.QueryPacketCommitmentsRequest{
-		PortId:     portid,
-		ChannelId:  channelid,
-		Pagination: DefaultPageRequest(),
-	})
-	if err != nil {
-		return nil, err
+	p := DefaultPageRequest()
+	commitments := &chantypes.QueryPacketCommitmentsResponse{}
+
+	for {
+		res, err := qc.PacketCommitments(ctx, &chantypes.QueryPacketCommitmentsRequest{
+			PortId:     portid,
+			ChannelId:  channelid,
+			Pagination: p,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		commitments.Commitments = append(commitments.Commitments, res.Commitments...)
+		commitments.Height = res.Height
+		next := res.GetPagination().GetNextKey()
+		if len(next) == 0 {
+			break
+		}
+
+		time.Sleep(PaginationDelay)
+		p.Key = next
 	}
-	return c, nil
+	return commitments, nil
 }
 
 // QueryPacketAcknowledgements returns an array of packet acks
-// TODO add pagination support
-func (cc *CosmosProvider) QueryPacketAcknowledgements(ctx context.Context, height uint64, channelid, portid string) (acknowledgements []*chantypes.PacketState, err error) {
+func (cc *CosmosProvider) QueryPacketAcknowledgements(ctx context.Context, height uint64, channelid, portid string) ([]*chantypes.PacketState, error) {
 	qc := chantypes.NewQueryClient(cc)
-	acks, err := qc.PacketAcknowledgements(ctx, &chantypes.QueryPacketAcknowledgementsRequest{
-		PortId:     portid,
-		ChannelId:  channelid,
-		Pagination: DefaultPageRequest(),
-	})
-	if err != nil {
-		return nil, err
+	p := DefaultPageRequest()
+	acknowledgements := []*chantypes.PacketState{}
+	for {
+		res, err := qc.PacketAcknowledgements(ctx, &chantypes.QueryPacketAcknowledgementsRequest{
+			PortId:     portid,
+			ChannelId:  channelid,
+			Pagination: p,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		acknowledgements = append(acknowledgements, res.Acknowledgements...)
+		next := res.GetPagination().GetNextKey()
+		if len(next) == 0 {
+			break
+		}
+
+		time.Sleep(PaginationDelay)
+		p.Key = next
 	}
-	return acks.Acknowledgements, nil
+
+	return acknowledgements, nil
 }
 
 // QueryUnreceivedPackets returns a list of unrelayed packet commitments
@@ -693,7 +1001,6 @@ func (cc *CosmosProvider) QueryUnreceivedPackets(ctx context.Context, height uin
 func sendPacketQuery(channelID string, portID string, seq uint64) string {
 	x := []string{
 		fmt.Sprintf("%s.packet_src_channel='%s'", spTag, channelID),
-		fmt.Sprintf("%s.packet_src_port='%s'", spTag, portID),
 		fmt.Sprintf("%s.packet_sequence='%d'", spTag, seq),
 	}
 	return strings.Join(x, " AND ")
@@ -702,7 +1009,6 @@ func sendPacketQuery(channelID string, portID string, seq uint64) string {
 func writeAcknowledgementQuery(channelID string, portID string, seq uint64) string {
 	x := []string{
 		fmt.Sprintf("%s.packet_dst_channel='%s'", waTag, channelID),
-		fmt.Sprintf("%s.packet_dst_port='%s'", waTag, portID),
 		fmt.Sprintf("%s.packet_sequence='%d'", waTag, seq),
 	}
 	return strings.Join(x, " AND ")
@@ -715,17 +1021,24 @@ func (cc *CosmosProvider) QuerySendPacket(
 	sequence uint64,
 ) (provider.PacketInfo, error) {
 	q := sendPacketQuery(srcChanID, srcPortID, sequence)
+
 	ibcMsgs, err := cc.queryIBCMessages(ctx, cc.log, 1, 1000, q)
 	if err != nil {
 		return provider.PacketInfo{}, err
 	}
+
 	for _, msg := range ibcMsgs {
-		if pi, ok := msg.info.(*packetInfo); ok {
-			if pi.Sequence == sequence {
+		if msg.EventType != chantypes.EventTypeSendPacket {
+			continue
+		}
+
+		if pi, ok := msg.Info.(*chains.PacketInfo); ok {
+			if pi.SourceChannel == srcChanID && pi.SourcePort == srcPortID && pi.Sequence == sequence {
 				return provider.PacketInfo(*pi), nil
 			}
 		}
 	}
+
 	return provider.PacketInfo{}, fmt.Errorf("no ibc messages found for send_packet query: %s", q)
 }
 
@@ -736,17 +1049,24 @@ func (cc *CosmosProvider) QueryRecvPacket(
 	sequence uint64,
 ) (provider.PacketInfo, error) {
 	q := writeAcknowledgementQuery(dstChanID, dstPortID, sequence)
+
 	ibcMsgs, err := cc.queryIBCMessages(ctx, cc.log, 1, 1000, q)
 	if err != nil {
 		return provider.PacketInfo{}, err
 	}
+
 	for _, msg := range ibcMsgs {
-		if pi, ok := msg.info.(*packetInfo); ok {
-			if pi.Sequence == sequence {
+		if msg.EventType != chantypes.EventTypeWriteAck {
+			continue
+		}
+
+		if pi, ok := msg.Info.(*chains.PacketInfo); ok {
+			if pi.DestChannel == dstChanID && pi.DestPort == dstPortID && pi.Sequence == sequence {
 				return provider.PacketInfo(*pi), nil
 			}
 		}
 	}
+
 	return provider.PacketInfo{}, fmt.Errorf("no ibc messages found for write_acknowledgement query: %s", q)
 }
 
@@ -767,6 +1087,29 @@ func (cc *CosmosProvider) QueryUnreceivedAcknowledgements(ctx context.Context, h
 // QueryNextSeqRecv returns the next seqRecv for a configured channel
 func (cc *CosmosProvider) QueryNextSeqRecv(ctx context.Context, height int64, channelid, portid string) (recvRes *chantypes.QueryNextSequenceReceiveResponse, err error) {
 	key := host.NextSequenceRecvKey(portid, channelid)
+
+	value, proofBz, proofHeight, err := cc.QueryTendermintProof(ctx, height, key)
+	if err != nil {
+		return nil, err
+	}
+
+	// check if next sequence receive exists
+	if len(value) == 0 {
+		return nil, sdkerrors.Wrapf(chantypes.ErrChannelNotFound, "portID (%s), channelID (%s)", portid, channelid)
+	}
+
+	sequence := binary.BigEndian.Uint64(value)
+
+	return &chantypes.QueryNextSequenceReceiveResponse{
+		NextSequenceReceive: sequence,
+		Proof:               proofBz,
+		ProofHeight:         proofHeight,
+	}, nil
+}
+
+// QueryNextSeqAck returns the next seqAck for a configured channel
+func (cc *CosmosProvider) QueryNextSeqAck(ctx context.Context, height int64, channelid, portid string) (recvRes *chantypes.QueryNextSequenceReceiveResponse, err error) {
+	key := host.NextSequenceAckKey(portid, channelid)
 
 	value, proofBz, proofHeight, err := cc.QueryTendermintProof(ctx, height, key)
 	if err != nil {
@@ -854,37 +1197,13 @@ func (cc *CosmosProvider) QueryLatestHeight(ctx context.Context) (int64, error) 
 	return stat.SyncInfo.LatestBlockHeight, nil
 }
 
-// QueryHeaderAtHeight returns the header at a given height
-func (cc *CosmosProvider) QueryHeaderAtHeight(ctx context.Context, height int64) (ibcexported.Header, error) {
-	var (
-		page    = 1
-		perPage = 100000
-	)
-	if height <= 0 {
-		return nil, fmt.Errorf("must pass in valid height, %d not valid", height)
-	}
-
-	res, err := cc.RPCClient.Commit(ctx, &height)
+// Query current node status
+func (cc *CosmosProvider) QueryStatus(ctx context.Context) (*coretypes.ResultStatus, error) {
+	status, err := cc.RPCClient.Status(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query node status: %w", err)
 	}
-
-	val, err := cc.RPCClient.Validators(ctx, &height, &page, &perPage)
-	if err != nil {
-		return nil, err
-	}
-
-	protoVal, err := tmtypes.NewValidatorSet(val.Validators).ToProto()
-	if err != nil {
-		return nil, err
-	}
-
-	return &tmclient.Header{
-		// NOTE: This is not a SignedHeader
-		// We are missing a light.Commit type here
-		SignedHeader: res.SignedHeader.ToProto(),
-		ValidatorSet: protoVal,
-	}, nil
+	return status, nil
 }
 
 // QueryDenomTrace takes a denom from IBC and queries the information about it
@@ -900,16 +1219,30 @@ func (cc *CosmosProvider) QueryDenomTrace(ctx context.Context, denom string) (*t
 }
 
 // QueryDenomTraces returns all the denom traces from a given chain
-// TODO add pagination support
 func (cc *CosmosProvider) QueryDenomTraces(ctx context.Context, offset, limit uint64, height int64) ([]transfertypes.DenomTrace, error) {
-	transfers, err := transfertypes.NewQueryClient(cc).DenomTraces(ctx,
-		&transfertypes.QueryDenomTracesRequest{
-			Pagination: DefaultPageRequest(),
-		})
-	if err != nil {
-		return nil, err
+	qc := transfertypes.NewQueryClient(cc)
+	p := DefaultPageRequest()
+	transfers := []transfertypes.DenomTrace{}
+	for {
+		res, err := qc.DenomTraces(ctx,
+			&transfertypes.QueryDenomTracesRequest{
+				Pagination: p,
+			})
+
+		if err != nil || res == nil {
+			return nil, err
+		}
+
+		transfers = append(transfers, res.DenomTraces...)
+		next := res.GetPagination().GetNextKey()
+		if len(next) == 0 {
+			break
+		}
+
+		time.Sleep(PaginationDelay)
+		p.Key = next
 	}
-	return transfers.DenomTraces, nil
+	return transfers, nil
 }
 
 func (cc *CosmosProvider) QueryStakingParams(ctx context.Context) (*stakingtypes.Params, error) {
@@ -925,7 +1258,7 @@ func DefaultPageRequest() *querytypes.PageRequest {
 		Key:        []byte(""),
 		Offset:     0,
 		Limit:      1000,
-		CountTotal: true,
+		CountTotal: false,
 	}
 }
 
@@ -943,7 +1276,7 @@ func (cc *CosmosProvider) QueryConsensusStateABCI(ctx context.Context, clientID 
 	}
 
 	// TODO do we really want to create a new codec? ChainClient exposes proto.Marshaler
-	cdc := codec.NewProtoCodec(cc.Codec.InterfaceRegistry)
+	cdc := codec.NewProtoCodec(cc.Cdc.InterfaceRegistry)
 
 	cs, err := clienttypes.UnmarshalConsensusState(cdc, value)
 	if err != nil {
